@@ -331,10 +331,40 @@ body.nav-open .sidebar{transform:none}
 .worker-panel-foot{display:flex;align-items:center;gap:8px;margin-top:16px;padding-top:12px;border-top:1px solid rgba(56,189,248,.08);font-size:12px;color:var(--text-mute);line-height:1.5}
 .worker-panel-foot i{color:var(--cyan-400)}
 
+/* Error Quarantine Panel */
+.error-quarantine-panel{margin-top:20px;border-radius:20px;background:linear-gradient(135deg,rgba(30,10,18,.75),rgba(15,10,25,.85));border:1px solid rgba(248,113,113,.25);backdrop-filter:blur(20px);padding:20px 24px;box-shadow:0 20px 60px rgba(0,0,0,.6),0 0 30px rgba(248,113,113,.08);position:relative;overflow:hidden;transition:all var(--dur) var(--ease)}
+.error-quarantine-panel::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;background:linear-gradient(180deg,#ef4444,#f87171,#f43f5e)}
+.eq-head{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid rgba(248,113,113,.15)}
+.eq-title{display:flex;align-items:center;gap:14px}
+.eq-icon{width:44px;height:44px;border-radius:14px;background:linear-gradient(135deg,rgba(239,68,68,.25),rgba(244,63,94,.15));border:1px solid rgba(248,113,113,.4);display:grid;place-items:center;color:#f87171;font-size:20px;box-shadow:0 0 20px rgba(239,68,68,.3);animation:iconFloat 4s ease-in-out infinite}
+.eq-heading{font-family:'Cinzel',serif;font-size:16px;font-weight:900;letter-spacing:1px;color:#fecaca}
+.eq-sub{font-size:11.5px;color:rgba(254,202,202,.7);margin-top:2px}
+.eq-badge{display:inline-flex;align-items:center;gap:6px;padding:6px 14px;border-radius:99px;font-size:12px;font-weight:800;font-family:'JetBrains Mono',monospace;background:rgba(239,68,68,.18);color:#fca5a5;border:1px solid rgba(239,68,68,.35)}
+.eq-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.btn-danger-glow{background:linear-gradient(135deg,#dc2626,#ef4444) !important;color:#fff !important;border:none !important;box-shadow:0 8px 24px rgba(239,68,68,.4) !important;font-weight:700}
+.btn-danger-glow:hover{box-shadow:0 10px 30px rgba(239,68,68,.65) !important;transform:translateY(-2px)}
+.eq-body{overflow-x:auto}
+.eq-table{width:100%;border-collapse:separate;border-spacing:0 8px;font-size:12px}
+.eq-table th{text-align:left;padding:8px 12px;font-size:11px;font-weight:700;color:var(--text-mute);text-transform:uppercase;letter-spacing:.6px}
+.eq-row{background:rgba(10,15,30,.6);border:1px solid rgba(248,113,113,.12);border-radius:12px;transition:all var(--dur) var(--ease)}
+.eq-row:hover{background:rgba(20,20,40,.8);border-color:rgba(248,113,113,.3)}
+.eq-row td{padding:12px;vertical-align:middle}
+.eq-row td:first-child{border-top-left-radius:12px;border-bottom-left-radius:12px}
+.eq-row td:last-child{border-top-right-radius:12px;border-bottom-right-radius:12px}
+.eq-uid{font-family:'JetBrains Mono',monospace;font-weight:700;color:#fca5a5;display:flex;align-items:center;gap:8px}
+.eq-reason{color:#fecaca;font-size:12px;line-height:1.4;max-width:320px;word-break:break-word}
+.eq-type{display:inline-block;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;background:rgba(239,68,68,.15);color:#fca5a5;border:1px solid rgba(239,68,68,.25)}
+.eq-time{color:var(--text-dim);font-family:'JetBrains Mono',monospace;font-size:11px}
+.eq-acts{display:flex;gap:6px;justify-content:flex-end}
+.eq-empty{text-align:center;padding:30px 16px;color:rgba(254,202,202,.6);font-size:13px}
+.eq-empty i{color:#34d399;font-size:24px;margin-bottom:8px;display:block}
+
 @media(max-width:768px){
   .worker-top-pill{display:none}
   .worker-panel-body{flex-direction:column;align-items:stretch}
   .worker-stepper{justify-content:center}
+  .eq-head{flex-direction:column;align-items:flex-start}
+  .eq-actions{width:100%;justify-content:flex-start}
 }
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
 </style>
@@ -472,6 +502,7 @@ body.nav-open .sidebar{transform:none}
         <button onclick="setFilter('in_match',this)">Match</button>
         <button onclick="setFilter('online',this)">Online</button>
         <button onclick="setFilter('paused',this)">Paused</button>
+        <button onclick="setFilter('error',this)" id="filter-error-btn" style="color:#f87171">Errors (<span id="node-error-badge-count">0</span>)</button>
       </div>
     </div>
     <div class="grid" id="accounts-container">
@@ -498,6 +529,29 @@ body.nav-open .sidebar{transform:none}
     <div class="term">
       <div class="term-head">@official:~# tail -f /var/log/CSR YEAMIN.log</div>
       <div class="term-body" id="console-stream" onscroll="handleLogScroll()"></div>
+    </div>
+
+    <!-- ERROR QUARANTINE & REALTIME PURGE BOX -->
+    <div class="error-quarantine-panel" id="terminal-error-quarantine">
+      <div class="eq-head">
+        <div class="eq-title">
+          <div class="eq-icon"><i class="fa-solid fa-triangle-exclamation"></i></div>
+          <div>
+            <div class="eq-heading">FAILED NODES & ERROR QUARANTINE</div>
+            <div class="eq-sub">Real-Time Error ID Detection · Never Use Bad IDs Again</div>
+          </div>
+        </div>
+        <div class="eq-actions">
+          <span class="eq-badge" id="eq-badge-count"><i class="fa-solid fa-bug"></i> <span id="eq-count">0</span> Error IDs</span>
+          <button class="btn btn-danger-glow" id="btn-purge-errors" onclick="deleteAllErrorAccounts()"><i class="fa-solid fa-dumpster-fire"></i> 100% Delete All Error IDs</button>
+          <button class="btn primary" onclick="openAddModal()"><i class="fa-solid fa-plus"></i> Add New Account</button>
+        </div>
+      </div>
+      <div class="eq-body">
+        <div id="eq-content">
+          <div class="eq-empty"><i class="fa-solid fa-circle-check"></i>All nodes healthy! Zero error IDs detected in terminal.</div>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -653,9 +707,120 @@ async function deleteAccount(uid){
   if(!confirm(`Delete node ${uid}?`))return;
   try{
     const d=await post("/api/account/delete",{uid});
-    if(d.status==="ok"){toast(`Node ${uid} deleted`,"success");const c=document.getElementById("acc-"+uid);if(c)c.remove();fetchStats()}
-    else toast(d.error||"Delete failed","error");
+    if(d.status==="ok"){
+      toast(`Node ${uid} permanently deleted`,"success");
+      const c=document.getElementById("acc-"+uid);
+      if(c)c.remove();
+      fetchStats();
+    } else {
+      toast(d.error||"Delete failed","error");
+    }
   }catch(e){toast("Backend offline","error")}
+}
+
+async function deleteErrorAccount(uid){
+  if(!confirm(`⚠️ 1000% Permanently delete Error ID ${uid}? This will remove it from accounts.json immediately.`))return;
+  try{
+    const d=await post("/api/account/delete",{uid});
+    if(d.status==="ok"){
+      toast(`🗑️ Error ID ${uid} permanently deleted`,"success");
+      fetchStats();
+    } else {
+      toast(d.error||"Delete failed","error");
+    }
+  }catch(e){toast("Backend offline","error")}
+}
+
+async function deleteAllErrorAccounts(){
+  const count = cachedErrorAccounts.length;
+  if(count === 0){
+    toast("No error IDs to delete","info");
+    return;
+  }
+  if(!confirm(`⚠️ 1000% REALTIME PURGE: Delete all ${count} error IDs? They will be removed from accounts.json, tasks stopped, and never run again.`))return;
+  try{
+    const d=await post("/api/account/delete_errors");
+    if(d.status==="ok"){
+      toast(`🗑️ Purged ${d.deleted_count} error IDs permanently!`,"success");
+      cachedErrorAccounts = [];
+      renderErrorAccounts([]);
+      fetchStats();
+    } else {
+      toast(d.error||"Purge failed","error");
+    }
+  }catch(e){toast("Backend offline","error")}
+}
+
+let cachedErrorAccounts = [];
+
+function renderErrorAccounts(errList){
+  cachedErrorAccounts = Array.isArray(errList) ? errList : [];
+  const count = cachedErrorAccounts.length;
+  setText("eq-count", count);
+  setText("node-error-badge-count", count);
+
+  const filterBtn = document.getElementById("filter-error-btn");
+  if(filterBtn){
+    filterBtn.style.display = count > 0 ? "" : "";
+    filterBtn.style.fontWeight = count > 0 ? "800" : "400";
+  }
+
+  const container = document.getElementById("eq-content");
+  if(!container) return;
+
+  if(count === 0){
+    container.innerHTML = `<div class="eq-empty"><i class="fa-solid fa-circle-check"></i>All nodes healthy! Zero error IDs detected in terminal.</div>`;
+    return;
+  }
+
+  let html = `<table class="eq-table">
+    <thead>
+      <tr>
+        <th>Account ID</th>
+        <th>Type</th>
+        <th>Error Reason / Terminal Log</th>
+        <th>Timestamp</th>
+        <th style="text-align:right">Actions</th>
+      </tr>
+    </thead>
+    <tbody>`;
+
+  cachedErrorAccounts.forEach(err => {
+    const uid = esc(err.uid);
+    const reason = esc(err.reason || "Authentication/Connection Error");
+    const authType = esc(err.auth_type || "guest");
+    const lastSeen = esc(err.last_seen || "--:--:--");
+    const errCount = err.error_count || 1;
+
+    html += `
+      <tr class="eq-row" id="err-row-${uid}">
+        <td>
+          <div class="eq-uid">
+            <i class="fa-solid fa-triangle-exclamation" style="color:#ef4444"></i>
+            <span>${uid}</span>
+            <button class="act" style="width:26px;height:26px;font-size:10px" onclick="copyText('${uid}','UID')" title="Copy UID"><i class="fa-solid fa-copy"></i></button>
+          </div>
+        </td>
+        <td><span class="eq-type">${authType}</span></td>
+        <td>
+          <div class="eq-reason">
+            <strong>${reason}</strong>
+            ${errCount > 1 ? `<span style="color:#f87171;font-size:10px;margin-left:6px">(${errCount}x failures)</span>` : ''}
+          </div>
+        </td>
+        <td><span class="eq-time">${lastSeen}</span></td>
+        <td>
+          <div class="eq-acts">
+            <button class="btn btn-danger-glow" style="padding:6px 12px;font-size:11px" onclick="deleteErrorAccount('${uid}')" title="100% Delete from accounts.json">
+              <i class="fa-solid fa-trash"></i> Delete
+            </button>
+          </div>
+        </td>
+      </tr>`;
+  });
+
+  html += `</tbody></table>`;
+  container.innerHTML = html;
 }
 
 async function refreshAcc(uid){
@@ -696,6 +861,7 @@ function filterAccounts(){
     if(activeFilter==="in_match")ok=ok&&st.includes("match")&&!paused;
     else if(activeFilter==="online")ok=ok&&(st.includes("online")||st.includes("match"))&&!paused;
     else if(activeFilter==="paused")ok=ok&&paused;
+    else if(activeFilter==="error")ok=ok&&(st.includes("error")||card.dataset.isError==="1");
     card.style.display=ok?"":"none";
   });
 }
@@ -735,7 +901,9 @@ function renderAccounts(accounts){
     const status=paused?"PAUSED":(acc.status||"ONLINE");
 
     let stCls="online",stIcon="fa-circle",stText="Online";
+    const isError = Boolean(acc.status === "ERROR" || acc.error_reason);
     if(paused){stCls="paused";stIcon="fa-pause";stText="Paused"}
+    else if(isError){stCls="offline";stIcon="fa-triangle-exclamation";stText="Error"}
     else if(status==="IN_MATCH"){stCls="match";stIcon="fa-crosshairs";stText="In Match"}
     else if(status==="SEARCHING"){stCls="connecting";stIcon="fa-magnifying-glass";stText="Searching"}
     else if(status==="CONNECTING"){stCls="connecting";stIcon="fa-spinner";stText="Connecting"}
@@ -754,7 +922,7 @@ function renderAccounts(accounts){
 
     let card=document.getElementById("acc-"+uid);
     if(!card){card=document.createElement("div");card.id="acc-"+uid;card.className="node";container.appendChild(card)}
-    card.dataset.uid=uid;card.dataset.nick=acc.nickname||"";card.dataset.status=stCls;card.dataset.paused=paused?"1":"0";
+    card.dataset.uid=uid;card.dataset.nick=acc.nickname||"";card.dataset.status=stCls;card.dataset.paused=paused?"1":"0";card.dataset.isError=isError?"1":"0";
 
     card.innerHTML=`
       <div class="node-head">
@@ -950,6 +1118,8 @@ async function fetchStats(){
     setText("p-rate",Number(d.exp_per_hour||0).toLocaleString());
 
     cachedLogs=logs;
+    const errs = Array.isArray(d.error_accounts) ? d.error_accounts : [];
+    renderErrorAccounts(errs);
     renderAccounts(accs);
     renderLogs(logs);
     setStatus(true);
