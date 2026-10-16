@@ -67,6 +67,8 @@ FORCE_REGION = "BD"
 # Cache invalidation thresholds
 MAX_CONSECUTIVE_PARSE_FAILURES = 5.0
 NON_MATCH_RECONNECT_DELAY = 1.0
+GATEWAY_IDLE_TIMEOUT = 300.0
+MAX_GATEWAY_IDLE_TICKS = int(GATEWAY_IDLE_TIMEOUT / 0.5)
 
 FALLBACK_UID = ""
 FALLBACK_PASSWORD = ""
@@ -1750,8 +1752,17 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                         data = await asyncio.wait_for(reader.read(8192), timeout=0.5)
                     except asyncio.TimeoutError:
                         no_response_count += 1
-                        if no_response_count > 80:
-                            log_warn(f"Gateway silent ({uid_str}). Reconnecting...")
+                        # Send TCP keepalive every 10 seconds while searching to maintain NAT and gateway active session
+                        if no_response_count > 0 and no_response_count % 20 == 0:
+                            try:
+                                ka = await send_keep_alive(forced_region)
+                                if ka and writer and not writer.is_closing():
+                                    writer.write(ka)
+                                    await writer.drain()
+                            except Exception:
+                                pass
+                        if no_response_count > MAX_GATEWAY_IDLE_TICKS:
+                            log_warn(f"Gateway silent ({uid_str}) for {int(GATEWAY_IDLE_TIMEOUT)}s. Reconnecting...")
                             raise ConnectionError("Gateway idle timeout")
                         continue
 
