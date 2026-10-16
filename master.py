@@ -13,10 +13,15 @@ import itertools
 import secrets
 import traceback
 import base64
+import concurrent.futures
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
 if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
     try:
         if hasattr(sys.stdout, 'reconfigure'):
             sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -37,30 +42,50 @@ import MasterFF_pb2
 # ==================== WEB DASHBOARD ====================
 from dashboard_server import bot_state, start_web_dashboard
 
-# ==================== CONFIGURATION ====================
+# ==================== MULTIPRONG TURBO THREAD POOL ====================
+_MULTIPRONG_THREAD_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=min(64, (os.cpu_count() or 4) * 8),
+    thread_name_prefix="multiprong_worker"
+)
+
+# ==================== CONFIGURATION (MULTIPRONG ASYNC TURBO) ====================
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 20030
 ACCOUNTS_FILE = "accounts.json"
 TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"
-TOKEN_CACHE_TTL = 1200
+TOKEN_CACHE_TTL = 3600
 
-# Match control (HUMAN-LIKE)
-START_MATCH_INTERVAL_MIN = 4.0
-START_MATCH_INTERVAL_MAX = 8.0
-START_MATCH_INTERVAL = 10.0
-NEW_MATCH_DELAY = 6.0
+# Turbo Engine Tuning (Super Fast Concurrency for Many IDs)
+SUPER_FAST_MODE = True
+MAX_CONCURRENT_LOGINS = 15
+_LOGIN_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_LOGINS)
+
+if SUPER_FAST_MODE:
+    START_MATCH_INTERVAL_MIN = 1.0
+    START_MATCH_INTERVAL_MAX = 2.5
+    START_MATCH_INTERVAL = 2.0
+    NEW_MATCH_DELAY = 1.0
+    NON_MATCH_RECONNECT_DELAY = 0.5
+    HUMAN_MODE = False
+else:
+    # Match control (HUMAN-LIKE)
+    START_MATCH_INTERVAL_MIN = 4.0
+    START_MATCH_INTERVAL_MAX = 8.0
+    START_MATCH_INTERVAL = 10.0
+    NEW_MATCH_DELAY = 6.0
+    NON_MATCH_RECONNECT_DELAY = 1.0
+    HUMAN_MODE = True
+
 MAX_MATCH_DURATION = 800
 MATCH_IDLE_TIMEOUT = 20.0
 MAX_CONCURRENT_MATCHES = 1
-HUMAN_MODE = True
 
 # Force region
 FORCE_REGION = "BD"
 
 # Cache invalidation thresholds
 MAX_CONSECUTIVE_PARSE_FAILURES = 5.0
-NON_MATCH_RECONNECT_DELAY = 1.0
 
 FALLBACK_UID = ""
 FALLBACK_PASSWORD = ""
@@ -68,24 +93,49 @@ FALLBACK_PASSWORD = ""
 
 # ==================== HUMAN-LIKE HELPERS ====================
 async def human_delay(base=1.0, variance=0.5):
+    if not HUMAN_MODE:
+        return 0.05
     delay = base + random.uniform(-variance, variance)
-    return max(0.1, delay)
+    return max(0.05, delay)
 
 
 async def human_jitter():
-    return random.uniform(0.05, 0.35)
+    if not HUMAN_MODE:
+        return 0.01
+    return random.uniform(0.02, 0.1)
 
 
-# ==================== ULTRA SAFE PERSISTENT DEVICE RANDOMIZER ====================
-def get_device_for_account(account_identifier: str) -> dict:
+# ==================== ULTRA FAST IN-MEMORY DEVICE RANDOMIZER ====================
+_DEVICES_CACHE: Optional[Dict[str, Any]] = None
+
+
+def _load_devices_cache() -> Dict[str, Any]:
+    global _DEVICES_CACHE
+    if _DEVICES_CACHE is not None:
+        return _DEVICES_CACHE
     devices = {}
     if os.path.exists(DEVICES_FILE):
         try:
             with open(DEVICES_FILE, "r", encoding="utf-8") as f:
                 devices = json.load(f)
         except Exception:
-            pass
+            devices = {}
+    _DEVICES_CACHE = devices
+    return _DEVICES_CACHE
 
+
+def _save_devices_worker(devices_snapshot: Dict[str, Any]):
+    try:
+        tmp_file = DEVICES_FILE + ".tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(devices_snapshot, f, indent=4)
+        os.replace(tmp_file, DEVICES_FILE)
+    except Exception as e:
+        log_err(f"Failed to save device: {e}")
+
+
+def get_device_for_account(account_identifier: str) -> dict:
+    devices = _load_devices_cache()
     acc_key = str(account_identifier)
 
     if acc_key in devices:
@@ -125,13 +175,7 @@ def get_device_for_account(account_identifier: str) -> dict:
     }
 
     devices[acc_key] = new_device
-
-    try:
-        with open(DEVICES_FILE, "w", encoding="utf-8") as f:
-            json.dump(devices, f, indent=4)
-    except Exception as e:
-        log_err(f"Failed to save device: {e}")
-
+    _MULTIPRONG_THREAD_POOL.submit(_save_devices_worker, dict(devices))
     return new_device
 
 
@@ -200,9 +244,9 @@ async def resolve_host_cloudflare(hostname: str) -> str:
         return None
 
     loop = asyncio.get_running_loop()
-    ip = await loop.run_in_executor(None, _query_cloudflare, CLOUDFLARE_PRIMARY_DNS)
+    ip = await loop.run_in_executor(_MULTIPRONG_THREAD_POOL, _query_cloudflare, CLOUDFLARE_PRIMARY_DNS)
     if not ip:
-        ip = await loop.run_in_executor(None, _query_cloudflare, CLOUDFLARE_SECONDARY_DNS)
+        ip = await loop.run_in_executor(_MULTIPRONG_THREAD_POOL, _query_cloudflare, CLOUDFLARE_SECONDARY_DNS)
     if not ip:
         try:
             ip_info = await loop.getaddrinfo(hostname, None, family=socket.AF_INET)
@@ -220,16 +264,16 @@ def optimize_tcp_socket(sock: socket.socket):
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
     except Exception:
         pass
 
 
 def optimize_udp_socket(sock: socket.socket):
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 131072)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
         if hasattr(socket, 'SIO_UDP_CONNRESET') and os.name == 'nt':
             try:
                 sock.ioctl(socket.SIO_UDP_CONNRESET, False)
@@ -242,8 +286,8 @@ def optimize_udp_socket(sock: socket.socket):
 # ==================== NETWORK & CRYPTO ====================
 client = httpx.AsyncClient(
     verify=False,
-    timeout=10.0,
-    limits=httpx.Limits(max_connections=100, max_keepalive_connections=50)
+    timeout=15.0,
+    limits=httpx.Limits(max_connections=2000, max_keepalive_connections=1000, keepalive_expiry=60.0)
 )
 
 headers = {
@@ -510,7 +554,7 @@ async def _get_total_match_count() -> int:
 # ==================== TOKEN CACHE ====================
 _token_cache_memo: Dict[str, Any] = {}
 _token_cache_memo_time: float = 0.0
-_TOKEN_CACHE_MEMO_TTL = 5.0
+_TOKEN_CACHE_MEMO_TTL = 3600.0
 
 
 def _json_serializer(obj):
@@ -561,17 +605,21 @@ def _load_token_cache() -> Dict[str, Any]:
         return {}
 
 
-def _save_token_cache(cache: Dict[str, Any]):
-    global _token_cache_memo, _token_cache_memo_time
+def _save_token_cache_disk(cache_copy: Dict[str, Any]):
     try:
         tmp_file = TOKEN_CACHE_FILE + ".tmp"
         with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, default=_json_serializer)
+            json.dump(cache_copy, f, indent=2, default=_json_serializer)
         os.replace(tmp_file, TOKEN_CACHE_FILE)
-        _token_cache_memo = cache
-        _token_cache_memo_time = time.time()
     except Exception as e:
         log_err(f"Token cache save error: {e}")
+
+
+def _save_token_cache(cache: Dict[str, Any]):
+    global _token_cache_memo, _token_cache_memo_time
+    _token_cache_memo = cache
+    _token_cache_memo_time = time.time()
+    _MULTIPRONG_THREAD_POOL.submit(_save_token_cache_disk, dict(cache))
 
 
 def cache_get(uid: str) -> Optional[Dict]:
@@ -615,36 +663,62 @@ async def aes_encrypt(payload, key, iv):
     return cipher.encrypt(pad(payload, AES.block_size))
 
 
+_VERSION_CACHE: Optional[Tuple[str, str, str]] = None
+_VERSION_CACHE_TIME: float = 0.0
+_VERSION_CACHE_TTL = 3600.0
+_VERSION_CONFIG_LOCK = asyncio.Lock()
+
+
 async def get_playstore_version():
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None,
-        lambda: play_scraper('com.dts.freefireth', lang='hi', country='id')
-    )
-    return result.get("version")
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            _MULTIPRONG_THREAD_POOL,
+            lambda: play_scraper('com.dts.freefireth', lang='hi', country='id')
+        )
+        return result.get("version")
+    except Exception:
+        return "1.132.8"
 
 
 async def version_config():
-    app_version = await get_playstore_version()
-    api_url = (
-        "https://version.ggwhitehawk.com/live/ver.php"
-        f"?version={app_version}"
-        "&lang=hi&device=android&channel=android"
-        "&appstore=googleplay&region=ID"
-        "&whitelist_version=1.3.0&whitelist_sp_version=1.0.0"
-    )
-    try:
-        response = await client.get(api_url)
-        response.raise_for_status()
-        data = response.json()
-        server_url = data.get("server_url")
-        remote_version = data.get("remote_version")
-        latest_release_version = data.get("latest_release_version")
-        if not server_url or not remote_version or not latest_release_version:
-            return None
-        return latest_release_version, remote_version, server_url
-    except Exception:
-        return None
+    global _VERSION_CACHE, _VERSION_CACHE_TIME
+    now = time.time()
+    if _VERSION_CACHE and (now - _VERSION_CACHE_TIME) < _VERSION_CACHE_TTL:
+        return _VERSION_CACHE
+
+    async with _VERSION_CONFIG_LOCK:
+        if _VERSION_CACHE and (now - _VERSION_CACHE_TIME) < _VERSION_CACHE_TTL:
+            return _VERSION_CACHE
+
+        app_version = await get_playstore_version()
+        api_url = (
+            "https://version.ggwhitehawk.com/live/ver.php"
+            f"?version={app_version}"
+            "&lang=hi&device=android&channel=android"
+            "&appstore=googleplay&region=ID"
+            "&whitelist_version=1.3.0&whitelist_sp_version=1.0.0"
+        )
+        try:
+            response = await client.get(api_url)
+            response.raise_for_status()
+            data = response.json()
+            server_url = data.get("server_url")
+            remote_version = data.get("remote_version")
+            latest_release_version = data.get("latest_release_version")
+            if server_url and remote_version and latest_release_version:
+                _VERSION_CACHE = (latest_release_version, remote_version, server_url)
+                _VERSION_CACHE_TIME = time.time()
+                return _VERSION_CACHE
+        except Exception:
+            pass
+
+        if _VERSION_CACHE:
+            return _VERSION_CACHE
+        fallback = ("OB55", "1.132.9", "https://clientbp.ppmainecoonghj.com")
+        _VERSION_CACHE = fallback
+        _VERSION_CACHE_TIME = time.time()
+        return fallback
 
 
 async def get_access_token(uid, password):
@@ -687,22 +761,24 @@ async def parse_results(parsed_results):
     result_dict = {}
     for result in parsed_results:
         field_data = {"wire_type": result.wire_type}
-        if result.wire_type == "varint":
-            field_data["data"] = result.data
-        elif result.wire_type == "string":
-            field_data["data"] = result.data
-        elif result.wire_type == "bytes":
+        if result.wire_type in ("varint", "string", "bytes"):
             field_data["data"] = result.data
         elif result.wire_type == "length_delimited":
-            field_data["data"] = await parse_results(result.data.results)
+            if hasattr(result.data, 'results'):
+                field_data["data"] = await parse_results(result.data.results)
+            else:
+                field_data["data"] = result.data
         result_dict[result.field] = field_data
     return result_dict
 
 
 async def decode_protobuf(data):
-    parsed_results = Parser().parse(data)
-    parsed_results_dict = await parse_results(parsed_results)
-    return json.dumps(parsed_results_dict)
+    loop = asyncio.get_running_loop()
+    parsed_results = await loop.run_in_executor(
+        _MULTIPRONG_THREAD_POOL,
+        lambda: Parser().parse(data)
+    )
+    return await parse_results(parsed_results)
 
 
 # ==================== MANUAL PROTOBUF WIRE FORMAT ====================
@@ -1020,7 +1096,7 @@ async def uleb_encode(n):
     return bytes(out)
 
 
-async def tea_enc(v0, v1, k0, k1, k2, k3):
+def tea_enc_sync(v0, v1, k0, k1, k2, k3):
     s = 0
     for _ in range(_ROUNDS):
         s = (s + _DELTA) & 0xFFFFFFFF
@@ -1033,7 +1109,11 @@ async def tea_enc(v0, v1, k0, k1, k2, k3):
     return v0, v1
 
 
-async def tea_dec(v0, v1, k0, k1, k2, k3):
+async def tea_enc(v0, v1, k0, k1, k2, k3):
+    return tea_enc_sync(v0, v1, k0, k1, k2, k3)
+
+
+def tea_dec_sync(v0, v1, k0, k1, k2, k3):
     s = (_DELTA * _ROUNDS) & 0xFFFFFFFF
     for _ in range(_ROUNDS):
         v1 = (v1 - (((((v0 << 4) & 0xFFFFFFFF) + k2) & 0xFFFFFFFF ^
@@ -1046,6 +1126,10 @@ async def tea_dec(v0, v1, k0, k1, k2, k3):
     return v0, v1
 
 
+async def tea_dec(v0, v1, k0, k1, k2, k3):
+    return tea_dec_sync(v0, v1, k0, k1, k2, k3)
+
+
 async def tea_cbc_encrypt(padded, key_bytes):
     k0, k1, k2, k3 = (struct.unpack_from("<I", key_bytes, o)[0] for o in (0, 4, 8, 12))
     out = bytearray(len(padded))
@@ -1055,7 +1139,7 @@ async def tea_cbc_encrypt(padded, key_bytes):
         xored = bytearray(8)
         for j in range(8):
             xored[j] = padded[i + j] ^ prev_cipher[j]
-        e0, e1 = await tea_enc(
+        e0, e1 = tea_enc_sync(
             struct.unpack_from("<I", xored, 0)[0],
             struct.unpack_from("<I", xored, 4)[0],
             k0, k1, k2, k3,
@@ -1178,7 +1262,7 @@ async def tea_cbc_decrypt(body, key_bytes):
     for i in range(0, len(body), 8):
         for j in range(8):
             xored[j] = body[i + j] ^ prev_intermediate[j]
-        d0, d1 = await tea_dec(
+        d0, d1 = tea_dec_sync(
             struct.unpack_from("<I", xored, 0)[0],
             struct.unpack_from("<I", xored, 4)[0],
             k0, k1, k2, k3
@@ -1710,7 +1794,9 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                         log_match("=" * 50)
 
                         try:
-                            res = json.loads(await decode_protobuf(hex_data[10:]))
+                            res = await decode_protobuf(hex_data[10:])
+                            if isinstance(res, str):
+                                res = json.loads(res)
                             token = None
                             udp_key = None
                             match_code = None
@@ -2326,7 +2412,8 @@ async def account_loop_guest(uid: str, password: str):
                 bot_state.update_status(str(uid), "CONNECTING")
             except Exception:
                 pass
-            account_data = await process_account_uid_pass(uid, password)
+            async with _LOGIN_SEMAPHORE:
+                account_data = await process_account_uid_pass(uid, password)
             if not account_data:
                 log_err(f"Login failed for UID: {uid}. Retry in 15s...")
                 try:
@@ -2356,7 +2443,8 @@ async def account_loop_token(token: str):
     while True:
         try:
             log_login("Starting login with Access Token...")
-            account_data = await process_account_token(token)
+            async with _LOGIN_SEMAPHORE:
+                account_data = await process_account_token(token)
             if not account_data:
                 log_err("Login failed for Token. Retry in 15s...")
                 await asyncio.sleep(15)
@@ -2396,11 +2484,13 @@ def load_accounts():
 async def main():
     log_banner()
 
-    log_separator("CONFIGURATION")
-    log_info(f"Start Match Interval : {START_MATCH_INTERVAL_MIN}-{START_MATCH_INTERVAL_MAX}s (random)")
+    log_separator("MULTIPRONG TURBO CONFIGURATION")
+    log_info(f"Engine Mode          : MULTIPRONG ASYNC TURBO")
+    log_info(f"Super Fast Mode      : {'ON' if SUPER_FAST_MODE else 'OFF'}")
+    log_info(f"Start Match Interval : {START_MATCH_INTERVAL_MIN}-{START_MATCH_INTERVAL_MAX}s")
+    log_info(f"Max Concurrent Logins: {MAX_CONCURRENT_LOGINS}")
     log_info(f"Offline Wait         : {NEW_MATCH_DELAY}s")
     log_info(f"Non-match Reconnect  : {NON_MATCH_RECONNECT_DELAY}s")
-    log_info(f"Cache Invalidation   : {int(MAX_CONSECUTIVE_PARSE_FAILURES)}x failures")
     log_info(f"Parallel Matches     : UNLIMITED (background)")
     log_info(f"Cache TTL            : {TOKEN_CACHE_TTL}s ({TOKEN_CACHE_TTL//60} min)")
     log_info(f"HUMAN MODE           : {'ON' if HUMAN_MODE else 'OFF'}")
@@ -2445,9 +2535,10 @@ async def main():
                 u = str(acc["uid"])
                 t = asyncio.create_task(account_loop_guest(u, acc["password"]))
                 bot_state.account_workers[u] = t
+            await asyncio.sleep(0.05)
 
-        log_ok(f"All {len(accounts)} accounts launched")
-        log_info("Watching for matches... (wait 2-5 minutes)")
+        log_ok(f"All {len(accounts)} accounts launched with Multiprong Async Engine")
+        log_info("Watching for matches... (Turbo active)")
 
     try:
         while True:
