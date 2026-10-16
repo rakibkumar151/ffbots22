@@ -225,9 +225,6 @@ async def handle_delete_account(request: web.Request) -> web.Response:
             bot_state.account_workers[uid].cancel()
             del bot_state.account_workers[uid]
 
-        if "on_delete_account" in bot_state.refresh_callbacks:
-            asyncio.create_task(bot_state.refresh_callbacks["on_delete_account"](uid))
-
         bot_state.log(f"Account {uid} removed", "warning", uid)
         return web.json_response({"status": "ok"})
     except Exception as e:
@@ -256,8 +253,6 @@ async def handle_pause_account(request: web.Request) -> web.Response:
                 acc["status"] = "PAUSED"
             else:
                 acc["status"] = "ONLINE"
-            if "on_pause_account" in bot_state.refresh_callbacks:
-                asyncio.create_task(bot_state.refresh_callbacks["on_pause_account"](uid, acc["is_paused"]))
             return web.json_response({"status": "ok", "is_paused": acc["is_paused"]})
         return web.json_response({"status": "error", "error": "Account not found"})
     except Exception as e:
@@ -271,8 +266,6 @@ async def handle_pause_all(request: web.Request) -> web.Response:
         for acc in bot_state.accounts.values():
             acc["is_paused"] = new_state
             acc["status"] = "PAUSED" if new_state else "ONLINE"
-        if "on_pause_all" in bot_state.refresh_callbacks:
-            asyncio.create_task(bot_state.refresh_callbacks["on_pause_all"](new_state))
         return web.json_response({"status": "ok", "all_paused": new_state})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
@@ -284,8 +277,6 @@ async def handle_restart_account(request: web.Request) -> web.Response:
         uid = str(data.get("uid")).strip()
         if uid in bot_state.account_workers:
             bot_state.account_workers[uid].cancel()
-        if "on_restart_account" in bot_state.refresh_callbacks:
-            asyncio.create_task(bot_state.refresh_callbacks["on_restart_account"](uid))
         return web.json_response({"status": "ok"})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})

@@ -13,8 +13,6 @@ import itertools
 import secrets
 import traceback
 import base64
-import multiprocessing as mp
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -47,10 +45,6 @@ TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"
 TOKEN_CACHE_TTL = 1200
 
-# Multiprocessing & High Concurrency Engine
-ENABLE_MULTIPROCESSING = True
-MAX_WORKER_PROCESSES = min(4, max(1, (os.cpu_count() or 2) // 2))
-
 # Match control (HUMAN-LIKE)
 START_MATCH_INTERVAL_MIN = 4.0
 START_MATCH_INTERVAL_MAX = 8.0
@@ -67,12 +61,9 @@ FORCE_REGION = "BD"
 # Cache invalidation thresholds
 MAX_CONSECUTIVE_PARSE_FAILURES = 5.0
 NON_MATCH_RECONNECT_DELAY = 1.0
-GATEWAY_IDLE_TIMEOUT = 300.0
-MAX_GATEWAY_IDLE_TICKS = int(GATEWAY_IDLE_TIMEOUT / 0.5)
 
 FALLBACK_UID = ""
 FALLBACK_PASSWORD = ""
-
 
 
 # ==================== HUMAN-LIKE HELPERS ====================
@@ -249,19 +240,11 @@ def optimize_udp_socket(sock: socket.socket):
 
 
 # ==================== NETWORK & CRYPTO ====================
-_client: Optional[httpx.AsyncClient] = None
-
-def get_http_client() -> httpx.AsyncClient:
-    global _client
-    if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(
-            verify=False,
-            timeout=10.0,
-            limits=httpx.Limits(max_connections=200, max_keepalive_connections=100)
-        )
-    return _client
-
-client = get_http_client()
+client = httpx.AsyncClient(
+    verify=False,
+    timeout=10.0,
+    limits=httpx.Limits(max_connections=100, max_keepalive_connections=50)
+)
 
 headers = {
     'User-Agent': 'UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)',
@@ -700,31 +683,26 @@ async def get_access_token(uid, password):
     return None
 
 
-def _parse_results_sync(parsed_results):
+async def parse_results(parsed_results):
     result_dict = {}
     for result in parsed_results:
         field_data = {"wire_type": result.wire_type}
-        if result.wire_type in ("varint", "string", "bytes"):
+        if result.wire_type == "varint":
+            field_data["data"] = result.data
+        elif result.wire_type == "string":
+            field_data["data"] = result.data
+        elif result.wire_type == "bytes":
             field_data["data"] = result.data
         elif result.wire_type == "length_delimited":
-            field_data["data"] = _parse_results_sync(result.data.results)
+            field_data["data"] = await parse_results(result.data.results)
         result_dict[result.field] = field_data
     return result_dict
 
 
-def _decode_protobuf_sync(data):
-    parsed_results = Parser().parse(data)
-    parsed_results_dict = _parse_results_sync(parsed_results)
-    return json.dumps(parsed_results_dict)
-
-
-async def parse_results(parsed_results):
-    return _parse_results_sync(parsed_results)
-
-
 async def decode_protobuf(data):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _decode_protobuf_sync, data)
+    parsed_results = Parser().parse(data)
+    parsed_results_dict = await parse_results(parsed_results)
+    return json.dumps(parsed_results_dict)
 
 
 # ==================== MANUAL PROTOBUF WIRE FORMAT ====================
@@ -1042,7 +1020,7 @@ async def uleb_encode(n):
     return bytes(out)
 
 
-def fast_tea_enc(v0: int, v1: int, k0: int, k1: int, k2: int, k3: int) -> Tuple[int, int]:
+async def tea_enc(v0, v1, k0, k1, k2, k3):
     s = 0
     for _ in range(_ROUNDS):
         s = (s + _DELTA) & 0xFFFFFFFF
@@ -1055,7 +1033,7 @@ def fast_tea_enc(v0: int, v1: int, k0: int, k1: int, k2: int, k3: int) -> Tuple[
     return v0, v1
 
 
-def fast_tea_dec(v0: int, v1: int, k0: int, k1: int, k2: int, k3: int) -> Tuple[int, int]:
+async def tea_dec(v0, v1, k0, k1, k2, k3):
     s = (_DELTA * _ROUNDS) & 0xFFFFFFFF
     for _ in range(_ROUNDS):
         v1 = (v1 - (((((v0 << 4) & 0xFFFFFFFF) + k2) & 0xFFFFFFFF ^
@@ -1068,15 +1046,7 @@ def fast_tea_dec(v0: int, v1: int, k0: int, k1: int, k2: int, k3: int) -> Tuple[
     return v0, v1
 
 
-async def tea_enc(v0, v1, k0, k1, k2, k3):
-    return fast_tea_enc(v0, v1, k0, k1, k2, k3)
-
-
-async def tea_dec(v0, v1, k0, k1, k2, k3):
-    return fast_tea_dec(v0, v1, k0, k1, k2, k3)
-
-
-def fast_tea_cbc_encrypt(padded: bytes, key_bytes: bytes) -> bytes:
+async def tea_cbc_encrypt(padded, key_bytes):
     k0, k1, k2, k3 = (struct.unpack_from("<I", key_bytes, o)[0] for o in (0, 4, 8, 12))
     out = bytearray(len(padded))
     prev_cipher = bytearray(8)
@@ -1085,7 +1055,7 @@ def fast_tea_cbc_encrypt(padded: bytes, key_bytes: bytes) -> bytes:
         xored = bytearray(8)
         for j in range(8):
             xored[j] = padded[i + j] ^ prev_cipher[j]
-        e0, e1 = fast_tea_enc(
+        e0, e1 = await tea_enc(
             struct.unpack_from("<I", xored, 0)[0],
             struct.unpack_from("<I", xored, 4)[0],
             k0, k1, k2, k3,
@@ -1100,20 +1070,12 @@ def fast_tea_cbc_encrypt(padded: bytes, key_bytes: bytes) -> bytes:
     return bytes(out)
 
 
-async def tea_cbc_encrypt(padded, key_bytes):
-    return fast_tea_cbc_encrypt(padded, key_bytes)
-
-
-def fast_build_padded(content: bytes) -> bytes:
+async def build_padded(content):
     pad_len = (8 - (len(content) + 10) % 8) % 8
     return bytes([pad_len, 0, 0]) + b"\x00" * pad_len + content + b"\x00" * 7
 
 
-async def build_padded(content):
-    return fast_build_padded(content)
-
-
-def fast_encode_header(layout, send_option, cmd, order_id, flags, length, k, v80) -> bytes:
+async def encode_header(layout, send_option, cmd, order_id, flags, length, k, v80):
     out = bytearray()
     for code in layout:
         value = {0: send_option, 1: cmd, 2: order_id, 3: flags, 4: length}[code]
@@ -1126,28 +1088,20 @@ def fast_encode_header(layout, send_option, cmd, order_id, flags, length, k, v80
     return bytes(out)
 
 
-async def encode_header(layout, send_option, cmd, order_id, flags, length, k, v80):
-    return fast_encode_header(layout, send_option, cmd, order_id, flags, length, k, v80)
-
-
-def fast_crc7_buff(crc: int, buf: bytes) -> int:
+async def crc7_buff(crc, buf):
     c = crc & 0x7F
     for b in buf:
         c = CRC7_TABLE[((2 * (c & 0xFF)) ^ (b & 0xFF)) & 0xFF] & 0x7F
     return c & 0x7F
 
 
-async def crc7_buff(crc, buf):
-    return fast_crc7_buff(crc, buf)
-
-
 async def sv_frame(msg_key, layout, send_option, cmd, order_id, flags, content, key, encrypted=True):
     k = key[0]
     v80 = ((k << 8) | k) & 0xFFFF
-    body = fast_tea_cbc_encrypt(fast_build_padded(content), key) if encrypted else content
-    hdr = bytearray([msg_key, 0]) + fast_encode_header(layout, send_option, cmd, order_id, flags, len(body), k, v80)
+    body = await tea_cbc_encrypt(await build_padded(content), key) if encrypted else content
+    hdr = bytearray([msg_key, 0]) + await encode_header(layout, send_option, cmd, order_id, flags, len(body), k, v80)
     packet = bytearray(hdr + body)
-    packet[1] = fast_crc7_buff(0, bytes(packet[2:])) & 0x7F
+    packet[1] = await crc7_buff(0, bytes(packet[2:])) & 0x7F
     return bytes(packet)
 
 
@@ -1209,12 +1163,12 @@ async def produce_xor_key(secret_key):
 
 
 async def parse_layout(layout):
-    if isinstance(layout, (str, int)):
-        return [int(ch) for ch in str(layout).strip()]
+    if isinstance(layout, str):
+        return [int(ch) for ch in layout.strip()]
     return list(layout)
 
 
-def fast_tea_cbc_decrypt(body: bytes, key_bytes: bytes) -> bytes:
+async def tea_cbc_decrypt(body, key_bytes):
     k0, k1, k2, k3 = (struct.unpack_from("<I", key_bytes, o)[0] for o in (0, 4, 8, 12))
     out = bytearray(len(body))
     prev_intermediate = bytearray(8)
@@ -1224,7 +1178,7 @@ def fast_tea_cbc_decrypt(body: bytes, key_bytes: bytes) -> bytes:
     for i in range(0, len(body), 8):
         for j in range(8):
             xored[j] = body[i + j] ^ prev_intermediate[j]
-        d0, d1 = fast_tea_dec(
+        d0, d1 = await tea_dec(
             struct.unpack_from("<I", xored, 0)[0],
             struct.unpack_from("<I", xored, 4)[0],
             k0, k1, k2, k3
@@ -1238,22 +1192,18 @@ def fast_tea_cbc_decrypt(body: bytes, key_bytes: bytes) -> bytes:
     return bytes(out)
 
 
-async def tea_cbc_decrypt(body, key_bytes):
-    return fast_tea_cbc_decrypt(body, key_bytes)
-
-
 async def build_hello_packet(text, key, layout):
     data = text.encode("utf-8")
     if len(data) > 25:
         raise ValueError(f"Text is too long ({len(data)} bytes)")
     content = b"\x10\x00\x00\x00" + data + b"\x00" * (29 - 4 - len(data))
     k, v80 = await produce_xor_key(key)
-    parsed_layout = await parse_layout(layout)
-    padded = fast_build_padded(content)
-    enc_body = fast_tea_cbc_encrypt(padded, key)
-    header_bytes = fast_encode_header(parsed_layout, 1, 1, 0, 1, len(enc_body), k, v80)
+    layout = await parse_layout(layout)
+    padded = await build_padded(content)
+    enc_body = await tea_cbc_encrypt(padded, key)
+    header_bytes = await encode_header(layout, 1, 1, 0, 1, len(enc_body), k, v80)
     packet = bytearray([0x63, 0x00]) + header_bytes + enc_body
-    packet[1] = fast_crc7_buff(0, packet[2:]) & 0x7F
+    packet[1] = await crc7_buff(0, packet[2:]) & 0x7F
     return bytes(packet).hex()
 
 
@@ -1278,7 +1228,7 @@ async def classify(frame):
 async def build_packet(msg_key, layout, send_option, cmd, order_id, flags, content, key, encrypted=True):
     k = key[0]
     v80 = ((k << 8) | k) & 0xFFFF
-    body = fast_tea_cbc_encrypt(fast_build_padded(content), key) if encrypted else content
+    body = await tea_cbc_encrypt(await build_padded(content), key) if encrypted else content
     hdr = bytearray([msg_key, 0])
     for code in layout:
         value = {0: send_option, 1: cmd, 2: order_id, 3: flags, 4: len(body)}[code]
@@ -1289,7 +1239,7 @@ async def build_packet(msg_key, layout, send_option, cmd, order_id, flags, conte
             hdr.append(v & 0xFF)
             hdr.append((v >> 8) & 0xFF)
     packet = bytearray(hdr + body)
-    packet[1] = fast_crc7_buff(0, bytes(packet[2:])) & 0x7F
+    packet[1] = await crc7_buff(0, bytes(packet[2:])) & 0x7F
     return bytes(packet)
 
 
@@ -1339,13 +1289,12 @@ async def keepalive_ping(sock, ip, port, key_bytes, mask, stop_event):
             pass
 
 
-def fast_try_header(buf, layout, k, v80):
+async def try_header(buf, layout, k, v80):
     off = 2
     out = {}
-    buf_len = len(buf)
     for code in layout:
         size = _FIELD_SIZES[code]
-        if off + size > buf_len:
+        if off + size > len(buf):
             return None
         out[_FIELD_NAMES[code]] = (buf[off] ^ k) if size == 1 else ((buf[off] | (buf[off + 1] << 8)) ^ v80) & 0xFFFF
         off += size
@@ -1353,11 +1302,7 @@ def fast_try_header(buf, layout, k, v80):
     return out
 
 
-async def try_header(buf, layout, k, v80):
-    return fast_try_header(buf, layout, k, v80)
-
-
-def fast_oicq_unpad(padded):
+async def oicq_unpad(padded):
     if not padded or len(padded) < 8:
         return None
     if not all(padded[-1 - i] == 0 for i in range(7)):
@@ -1368,27 +1313,22 @@ def fast_oicq_unpad(padded):
     return padded[s:e] if s < e else b""
 
 
-async def oicq_unpad(padded):
-    return fast_oicq_unpad(padded)
-
-
-def fast_decode_packet(packet, key, mask=None):
+async def decode_packet(packet, key, mask=None):
     data = bytes(packet) if isinstance(packet, bytes) else bytes.fromhex(packet)
     if len(data) < 8:
         return None
     k = key[0]
     v80 = ((k << 8) | k) & 0xFFFF
-    crc_ok = (data[1] & 0x7F) == fast_crc7_buff(0, data[2:])
+    crc_ok = (data[1] & 0x7F) == await crc7_buff(0, data[2:])
     candidates = []
     if mask:
-        ru = [int(c) for c in str(mask).strip()]
-        nr = [c for c in ru if c != 2]
+        ru, nr = await layouts_from_mask(mask)
         layouts = [("RUDP", ru), ("nonRUDP", nr)]
     else:
         layouts = [("RUDP", list(p)) for p in itertools.permutations([0, 1, 2, 3, 4])]
         layouts += [("nonRUDP", list(p)) for p in itertools.permutations([0, 1, 3, 4])]
     for kind, layout in layouts:
-        f = fast_try_header(data, layout, k, v80)
+        f = await try_header(data, layout, k, v80)
         if not f:
             continue
         if f["flags"] > 7 or f["sendOption"] > 7:
@@ -1401,8 +1341,8 @@ def fast_decode_packet(packet, key, mask=None):
         if f["flags"] & 1:
             if len(body) < 8 or len(body) % 8 != 0:
                 continue
-            padded = fast_tea_cbc_decrypt(body, key)
-            content = fast_oicq_unpad(padded)
+            padded = await tea_cbc_decrypt(body, key)
+            content = await oicq_unpad(padded)
             if content is None:
                 continue
         else:
@@ -1419,10 +1359,6 @@ def fast_decode_packet(packet, key, mask=None):
         return None
     candidates.sort(key=lambda c: (c["kind"] == "RUDP" or c["kind"] == "nonRUDP", c["score"]), reverse=True)
     return candidates[0]
-
-
-async def decode_packet(packet, key, mask=None):
-    return fast_decode_packet(packet, key, mask)
 
 
 # ============================================================
@@ -1752,17 +1688,8 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                         data = await asyncio.wait_for(reader.read(8192), timeout=0.5)
                     except asyncio.TimeoutError:
                         no_response_count += 1
-                        # Send TCP keepalive every 10 seconds while searching to maintain NAT and gateway active session
-                        if no_response_count > 0 and no_response_count % 20 == 0:
-                            try:
-                                ka = await send_keep_alive(forced_region)
-                                if ka and writer and not writer.is_closing():
-                                    writer.write(ka)
-                                    await writer.drain()
-                            except Exception:
-                                pass
-                        if no_response_count > MAX_GATEWAY_IDLE_TICKS:
-                            log_warn(f"Gateway silent ({uid_str}) for {int(GATEWAY_IDLE_TIMEOUT)}s. Reconnecting...")
+                        if no_response_count > 80:
+                            log_warn(f"Gateway silent ({uid_str}). Reconnecting...")
                             raise ConnectionError("Gateway idle timeout")
                         continue
 
@@ -2465,177 +2392,6 @@ def load_accounts():
     return accounts
 
 
-# ==================== MULTIPROCESSING ENGINE ====================
-class TaskProxy:
-    def __init__(self, key: str, cmd_queue=None):
-        self.key = key
-        self.cmd_queue = cmd_queue
-        self._cancelled = False
-
-    def cancel(self):
-        self._cancelled = True
-        if self.cmd_queue:
-            try:
-                self.cmd_queue.put({"type": "delete_account", "data": self.key})
-            except Exception:
-                pass
-
-    def done(self):
-        return self._cancelled
-
-
-class WorkerBotState:
-    def __init__(self, event_queue, worker_id: int):
-        self.event_queue = event_queue
-        self.worker_id = worker_id
-        self.accounts: Dict[str, Dict[str, Any]] = {}
-        self.account_credentials: Dict[str, Dict[str, Any]] = {}
-        self.account_workers: Dict[str, Any] = {}
-        self.refresh_callbacks: Dict[str, Any] = {}
-        self.paused_accounts: set = set()
-        self.all_paused: bool = False
-        self.logs: List[Dict[str, Any]] = []
-
-    def log(self, message: str, level: str = "info", uid: Optional[str] = None):
-        try:
-            self.event_queue.put_nowait(("log", (message, level, uid), {}))
-        except Exception:
-            pass
-
-    def register_account(self, uid: str, nickname: str, region: str, level: int, exp: int, likes: int = 0):
-        uid_str = str(uid)
-        self.accounts[uid_str] = {
-            "uid": uid_str, "nickname": nickname, "region": region,
-            "level": level, "current_exp": exp, "likes": likes
-        }
-        try:
-            self.event_queue.put_nowait(("register_account", (uid, nickname, region, level, exp, likes), {}))
-        except Exception:
-            pass
-
-    def update_exp(self, uid: str, current_exp: int, level: Optional[int] = None):
-        uid_str = str(uid)
-        if uid_str in self.accounts:
-            self.accounts[uid_str]["current_exp"] = current_exp
-            if level is not None:
-                self.accounts[uid_str]["level"] = level
-        try:
-            self.event_queue.put_nowait(("update_exp", (uid, current_exp, level), {}))
-        except Exception:
-            pass
-
-    def update_status(self, uid: str, status: str, active_matches: Optional[int] = None):
-        uid_str = str(uid)
-        if uid_str in self.accounts:
-            self.accounts[uid_str]["status"] = status
-            if active_matches is not None:
-                self.accounts[uid_str]["active_matches"] = active_matches
-        try:
-            self.event_queue.put_nowait(("update_status", (uid, status, active_matches), {}))
-        except Exception:
-            pass
-
-    def increment_match(self, uid: str):
-        try:
-            self.event_queue.put_nowait(("increment_match", (uid,), {}))
-        except Exception:
-            pass
-
-
-def run_worker_process(worker_id: int, assigned_accounts: list, ipc_event_queue, ipc_cmd_queue):
-    if sys.platform == "win32":
-        try:
-            if hasattr(sys.stdout, 'reconfigure'):
-                sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-            if hasattr(sys.stderr, 'reconfigure'):
-                sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-        except Exception:
-            pass
-
-    async def worker_main():
-        global bot_state
-        worker_state = WorkerBotState(ipc_event_queue, worker_id)
-        bot_state = worker_state
-        import dashboard_server
-        dashboard_server.bot_state = worker_state
-
-        log_ok(f"[Worker #{worker_id}] Process PID {os.getpid()} active with {len(assigned_accounts)} accounts")
-
-        stop_event = asyncio.Event()
-
-        async def command_listener():
-            loop = asyncio.get_running_loop()
-            while True:
-                try:
-                    cmd = await loop.run_in_executor(None, ipc_cmd_queue.get)
-                    if cmd is None or (isinstance(cmd, dict) and cmd.get("type") == "stop"):
-                        stop_event.set()
-                        break
-                    cmd_type = cmd.get("type")
-                    data = cmd.get("data")
-                    if cmd_type == "add_account":
-                        if "token" in data and data["token"]:
-                            t = str(data["token"]).strip()
-                            task = asyncio.create_task(account_loop_token(t))
-                            worker_state.account_workers[t[:10]] = task
-                        elif "uid" in data and "password" in data:
-                            u = str(data["uid"]).strip()
-                            p = str(data["password"]).strip()
-                            task = asyncio.create_task(account_loop_guest(u, p))
-                            worker_state.account_workers[u] = task
-                    elif cmd_type == "delete_account":
-                        uid = str(data).strip()
-                        if uid in worker_state.account_workers:
-                            worker_state.account_workers[uid].cancel()
-                            del worker_state.account_workers[uid]
-                    elif cmd_type == "restart_account":
-                        uid = str(data).strip()
-                        if uid in worker_state.account_workers:
-                            worker_state.account_workers[uid].cancel()
-                    elif cmd_type == "refresh_account":
-                        uid = str(data).strip()
-                        await refresh_account_profile(uid)
-                    elif cmd_type == "pause_account":
-                        uid = str(data.get("uid")).strip()
-                        is_paused = data.get("is_paused", False)
-                        if is_paused:
-                            worker_state.paused_accounts.add(uid)
-                        else:
-                            worker_state.paused_accounts.discard(uid)
-                    elif cmd_type == "pause_all":
-                        worker_state.all_paused = bool(data)
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    log_err(f"[Worker #{worker_id}] Command error: {e}")
-
-        cmd_task = asyncio.create_task(command_listener())
-
-        for acc in assigned_accounts:
-            if "token" in acc and acc["token"]:
-                t = asyncio.create_task(account_loop_token(acc["token"]))
-                worker_state.account_workers[acc["token"][:10]] = t
-            elif "uid" in acc and "password" in acc and acc["uid"]:
-                u = str(acc["uid"])
-                t = asyncio.create_task(account_loop_guest(u, acc["password"]))
-                worker_state.account_workers[u] = t
-
-        try:
-            await stop_event.wait()
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            pass
-        finally:
-            cmd_task.cancel()
-            for t in list(worker_state.account_workers.values()):
-                t.cancel()
-            await asyncio.gather(*worker_state.account_workers.values(), return_exceptions=True)
-
-    try:
-        asyncio.run(worker_main())
-    except Exception:
-        pass
-
-
 # ==================== MAIN ====================
 async def main():
     log_banner()
@@ -2649,13 +2405,29 @@ async def main():
     log_info(f"Cache TTL            : {TOKEN_CACHE_TTL}s ({TOKEN_CACHE_TTL//60} min)")
     log_info(f"HUMAN MODE           : {'ON' if HUMAN_MODE else 'OFF'}")
     log_info(f"FORCED REGION        : {FORCE_REGION}")
-    log_info(f"MULTIPROCESSING      : {'ON' if ENABLE_MULTIPROCESSING else 'OFF'} (Max {MAX_WORKER_PROCESSES} workers)")
 
     try:
         await start_web_dashboard(host=WEB_HOST, port=WEB_PORT)
         log_ok(f"Web Dashboard live -> http://localhost:{WEB_PORT}")
     except Exception as e:
         log_err(f"Could not start web dashboard: {e}")
+
+    async def on_account_added_handler(data):
+        if "token" in data and data["token"]:
+            t = str(data["token"]).strip()
+            task = asyncio.create_task(account_loop_token(t))
+            bot_state.account_workers[t[:10]] = task
+        elif "uid" in data and "password" in data:
+            u = str(data["uid"]).strip()
+            p = str(data["password"]).strip()
+            task = asyncio.create_task(account_loop_guest(u, p))
+            bot_state.account_workers[u] = task
+
+    async def on_refresh_account_handler(uid):
+        await refresh_account_profile(uid)
+
+    bot_state.refresh_callbacks["on_account_added"] = on_account_added_handler
+    bot_state.refresh_callbacks["on_refresh_account"] = on_refresh_account_handler
 
     accounts = load_accounts()
 
@@ -2665,171 +2437,30 @@ async def main():
     else:
         log_separator(f"LOADING {len(accounts)} ACCOUNTS")
 
-    worker_processes = []
-    worker_cmd_queues = []
-    ipc_event_queue = None
-    ipc_listener_task = None
-
-    if ENABLE_MULTIPROCESSING and len(accounts) > 0:
-        num_workers = min(MAX_WORKER_PROCESSES, len(accounts))
-        log_info(f"Distributing accounts across {num_workers} dedicated worker processes...")
-
-        partitions = [[] for _ in range(num_workers)]
-        for i, acc in enumerate(accounts):
-            partitions[i % num_workers].append(acc)
-
-        ipc_event_queue = mp.Queue()
-        worker_cmd_queues = [mp.Queue() for _ in range(num_workers)]
-
-        # Register proxies in dashboard account_workers
-        for i, acc in enumerate(accounts):
-            wid = i % num_workers
-            q = worker_cmd_queues[wid]
+        for acc in accounts:
             if "token" in acc and acc["token"]:
-                k = acc["token"][:10]
-                bot_state.account_workers[k] = TaskProxy(k, q)
-            elif "uid" in acc and acc["uid"]:
+                t = asyncio.create_task(account_loop_token(acc["token"]))
+                bot_state.account_workers[acc["token"][:10]] = t
+            elif "uid" in acc and "password" in acc and acc["uid"]:
                 u = str(acc["uid"])
-                bot_state.account_workers[u] = TaskProxy(u, q)
+                t = asyncio.create_task(account_loop_guest(u, acc["password"]))
+                bot_state.account_workers[u] = t
 
-        for wid in range(num_workers):
-            p = mp.Process(
-                target=run_worker_process,
-                args=(wid, partitions[wid], ipc_event_queue, worker_cmd_queues[wid]),
-                daemon=True
-            )
-            p.start()
-            worker_processes.append(p)
-
-        # IPC event reader task for main dashboard bot_state
-        async def ipc_event_listener():
-            loop = asyncio.get_running_loop()
-            while True:
-                try:
-                    item = await loop.run_in_executor(None, ipc_event_queue.get)
-                    if item is None:
-                        break
-                    action, args, kwargs = item
-                    if action == "log":
-                        bot_state.log(*args, **kwargs)
-                    elif action == "register_account":
-                        bot_state.register_account(*args, **kwargs)
-                    elif action == "update_exp":
-                        bot_state.update_exp(*args, **kwargs)
-                    elif action == "update_status":
-                        bot_state.update_status(*args, **kwargs)
-                    elif action == "increment_match":
-                        bot_state.increment_match(*args, **kwargs)
-                except asyncio.CancelledError:
-                    break
-                except Exception:
-                    pass
-
-        ipc_listener_task = asyncio.create_task(ipc_event_listener())
-
-        # Dashboard action handlers forwarding to worker processes
-        async def on_account_added_handler(data):
-            target_wid = 0
-            if worker_cmd_queues:
-                target_wid = random.randint(0, len(worker_cmd_queues) - 1)
-                q = worker_cmd_queues[target_wid]
-                q.put({"type": "add_account", "data": data})
-                if "token" in data and data["token"]:
-                    k = str(data["token"]).strip()[:10]
-                    bot_state.account_workers[k] = TaskProxy(k, q)
-                elif "uid" in data and data["uid"]:
-                    u = str(data["uid"]).strip()
-                    bot_state.account_workers[u] = TaskProxy(u, q)
-
-        async def on_refresh_account_handler(uid):
-            for q in worker_cmd_queues:
-                q.put({"type": "refresh_account", "data": uid})
-
-        async def on_delete_account_handler(uid):
-            for q in worker_cmd_queues:
-                q.put({"type": "delete_account", "data": uid})
-
-        async def on_restart_account_handler(uid):
-            for q in worker_cmd_queues:
-                q.put({"type": "restart_account", "data": uid})
-
-        async def on_pause_account_handler(uid, is_paused):
-            for q in worker_cmd_queues:
-                q.put({"type": "pause_account", "data": {"uid": uid, "is_paused": is_paused}})
-
-        async def on_pause_all_handler(new_state):
-            for q in worker_cmd_queues:
-                q.put({"type": "pause_all", "data": new_state})
-
-        bot_state.refresh_callbacks["on_account_added"] = on_account_added_handler
-        bot_state.refresh_callbacks["on_refresh_account"] = on_refresh_account_handler
-        bot_state.refresh_callbacks["on_delete_account"] = on_delete_account_handler
-        bot_state.refresh_callbacks["on_restart_account"] = on_restart_account_handler
-        bot_state.refresh_callbacks["on_pause_account"] = on_pause_account_handler
-        bot_state.refresh_callbacks["on_pause_all"] = on_pause_all_handler
-
-        log_ok(f"All {len(accounts)} accounts distributed and launched in parallel")
+        log_ok(f"All {len(accounts)} accounts launched")
         log_info("Watching for matches... (wait 2-5 minutes)")
-
-    else:
-        # Single-process Async Fallback mode
-        async def on_account_added_handler(data):
-            if "token" in data and data["token"]:
-                t = str(data["token"]).strip()
-                task = asyncio.create_task(account_loop_token(t))
-                bot_state.account_workers[t[:10]] = task
-            elif "uid" in data and "password" in data:
-                u = str(data["uid"]).strip()
-                p = str(data["password"]).strip()
-                task = asyncio.create_task(account_loop_guest(u, p))
-                bot_state.account_workers[u] = task
-
-        async def on_refresh_account_handler(uid):
-            await refresh_account_profile(uid)
-
-        bot_state.refresh_callbacks["on_account_added"] = on_account_added_handler
-        bot_state.refresh_callbacks["on_refresh_account"] = on_refresh_account_handler
-
-        if accounts:
-            for acc in accounts:
-                if "token" in acc and acc["token"]:
-                    t = asyncio.create_task(account_loop_token(acc["token"]))
-                    bot_state.account_workers[acc["token"][:10]] = t
-                elif "uid" in acc and "password" in acc and acc["uid"]:
-                    u = str(acc["uid"])
-                    t = asyncio.create_task(account_loop_guest(u, acc["password"]))
-                    bot_state.account_workers[u] = t
-
-            log_ok(f"All {len(accounts)} accounts launched")
-            log_info("Watching for matches... (wait 2-5 minutes)")
 
     try:
         while True:
             await asyncio.sleep(1)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        log_warn("Shutting down all accounts and processes...")
-        if worker_processes:
-            for q in worker_cmd_queues:
-                try:
-                    q.put(None)
-                except Exception:
-                    pass
-            for p in worker_processes:
-                p.join(timeout=2.0)
-                if p.is_alive():
-                    p.terminate()
-            if ipc_listener_task and not ipc_listener_task.done():
-                ipc_listener_task.cancel()
-        else:
-            for t in list(bot_state.account_workers.values()):
-                if hasattr(t, 'cancel'):
-                    t.cancel()
-            await asyncio.gather(*bot_state.account_workers.values(), return_exceptions=True)
+        log_warn("Shutting down all accounts...")
+        for t in list(bot_state.account_workers.values()):
+            t.cancel()
+        await asyncio.gather(*bot_state.account_workers.values(), return_exceptions=True)
         log_ok("All sessions cleanly closed.")
 
 
 if __name__ == "__main__":
-    mp.freeze_support()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
