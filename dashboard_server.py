@@ -103,6 +103,16 @@ class BotState:
                 return True
         return False
 
+    def revive_account(self, uid: str):
+        uid_str = str(uid).strip()
+        if not uid_str:
+            return
+        all_ids = self.get_all_linked_ids(uid_str)
+        all_ids.add(uid_str)
+        for i in all_ids:
+            self.deleted_uids.discard(i)
+            self.account_stop_events.pop(i, None)
+
     def register_stop_event(self, uid: str, event: asyncio.Event):
         uid_str = str(uid).strip()
         self.account_stop_events[uid_str] = event
@@ -472,12 +482,14 @@ async def handle_add_account(request: web.Request) -> web.Response:
                 pwd = str(data["password"]).strip()
                 if not uid or not pwd:
                     return web.json_response({"status": "error", "error": "UID and Password required"})
+                bot_state.revive_account(uid)
                 existing = [acc for acc in existing if not isinstance(acc, dict) or str(acc.get("uid")) != uid]
                 existing.append({"uid": uid, "password": pwd})
             elif "token" in data:
                 token = str(data["token"]).strip()
                 if not token:
                     return web.json_response({"status": "error", "error": "Token required"})
+                bot_state.revive_account(token)
                 existing = [acc for acc in existing if not isinstance(acc, dict) or acc.get("token") != token]
                 existing.append({"token": token})
             else:

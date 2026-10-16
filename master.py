@@ -2581,11 +2581,13 @@ async def main():
     async def on_account_added_handler(data):
         if "token" in data and data["token"]:
             t = str(data["token"]).strip()
+            bot_state.revive_account(t)
             task = asyncio.create_task(account_loop_token(t))
             bot_state.account_workers[t[:10]] = task
         elif "uid" in data and "password" in data:
             u = str(data["uid"]).strip()
             p = str(data["password"]).strip()
+            bot_state.revive_account(u)
             task = asyncio.create_task(account_loop_guest(u, p))
             bot_state.account_workers[u] = task
 
@@ -2606,10 +2608,13 @@ async def main():
 
         for acc in accounts:
             if "token" in acc and acc["token"]:
-                t = asyncio.create_task(account_loop_token(acc["token"]))
-                bot_state.account_workers[acc["token"][:10]] = t
+                t_str = str(acc["token"]).strip()
+                bot_state.revive_account(t_str)
+                t = asyncio.create_task(account_loop_token(t_str))
+                bot_state.account_workers[t_str[:10]] = t
             elif "uid" in acc and "password" in acc and acc["uid"]:
-                u = str(acc["uid"])
+                u = str(acc["uid"]).strip()
+                bot_state.revive_account(u)
                 t = asyncio.create_task(account_loop_guest(u, acc["password"]))
                 bot_state.account_workers[u] = t
 
