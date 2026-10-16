@@ -11,7 +11,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Set
 from aiohttp import web
 
 # ==================== PATHS ====================
@@ -49,8 +49,126 @@ class BotState:
         self.refresh_callbacks: Dict[str, Any] = {}
         self.account_credentials: Dict[str, Dict[str, Any]] = {}
         self.error_accounts: Dict[str, Dict[str, Any]] = {}
+        self.account_id_map: Dict[str, Set[str]] = {}
+        self.deleted_uids: Set[str] = set()
+        self.account_stop_events: Dict[str, asyncio.Event] = {}
+        self.active_writers: Dict[str, List[Any]] = {}
         self.game_workers: int = _load_game_worker_count()
         self.worker_event: asyncio.Event = asyncio.Event()
+
+    def link_account_ids(self, *ids):
+        valid = set(str(i).strip() for i in ids if i and str(i).strip())
+        if not valid:
+            return
+        merged = set(valid)
+        for i in valid:
+            if i in self.account_id_map:
+                merged.update(self.account_id_map[i])
+        for i in merged:
+            self.account_id_map[i] = merged
+
+    def get_all_linked_ids(self, uid: str) -> Set[str]:
+        uid_str = str(uid).strip()
+        if not uid_str:
+            return set()
+        group = set(self.account_id_map.get(uid_str, {uid_str}))
+        group.add(uid_str)
+        # Search registered accounts
+        for acc_id, acc in list(self.accounts.items()):
+            a_uid = str(acc.get("uid", "")).strip()
+            a_auth = str(acc.get("auth_uid", "")).strip()
+            a_acc = str(acc.get("account_id", "")).strip()
+            a_tok = str(acc.get("token", "")).strip()
+            candidates = {acc_id, a_uid, a_auth, a_acc, a_tok, a_tok[:20], a_tok[:10]} - {""}
+            if uid_str in candidates:
+                group.update(candidates)
+        # Search credentials
+        for cred_id, cred in list(self.account_credentials.items()):
+            c_uid = str(cred.get("auth_uid", "")).strip()
+            c_acc = str(cred.get("account_id", "")).strip()
+            c_tok = str(cred.get("token", "")).strip()
+            candidates = {cred_id, c_uid, c_acc, c_tok, c_tok[:20], c_tok[:10]} - {""}
+            if uid_str in candidates:
+                group.update(candidates)
+        return group
+
+    def is_deleted(self, uid: str) -> bool:
+        uid_str = str(uid).strip()
+        if not uid_str:
+            return False
+        if uid_str in self.deleted_uids:
+            return True
+        for linked in self.account_id_map.get(uid_str, ()):
+            if linked in self.deleted_uids:
+                return True
+        return False
+
+    def register_stop_event(self, uid: str, event: asyncio.Event):
+        uid_str = str(uid).strip()
+        self.account_stop_events[uid_str] = event
+        for linked in self.get_all_linked_ids(uid_str):
+            self.account_stop_events[linked] = event
+
+    def register_writer(self, uid: str, writer: Any):
+        uid_str = str(uid).strip()
+        if uid_str not in self.active_writers:
+            self.active_writers[uid_str] = []
+        self.active_writers[uid_str].append(writer)
+
+    def unregister_writer(self, uid: str, writer: Any):
+        uid_str = str(uid).strip()
+        if uid_str in self.active_writers:
+            try:
+                self.active_writers[uid_str].remove(writer)
+            except ValueError:
+                pass
+
+    def stop_and_purge_account(self, uid: str) -> Set[str]:
+        uid_str = str(uid).strip()
+        all_ids = self.get_all_linked_ids(uid_str)
+        all_ids.add(uid_str)
+
+        # 1. Mark as permanently deleted
+        self.deleted_uids.update(all_ids)
+
+        # 2. Trigger stop events immediately
+        for i in all_ids:
+            if i in self.account_stop_events:
+                try:
+                    self.account_stop_events[i].set()
+                except Exception:
+                    pass
+
+        # 3. Close any active network writers/sockets immediately
+        for i in all_ids:
+            writers = self.active_writers.pop(i, [])
+            for w in writers:
+                try:
+                    w.close()
+                except Exception:
+                    pass
+
+        # 4. Cancel all worker tasks registered under ANY linked id or prefix
+        for i in all_ids:
+            task = self.account_workers.pop(i, None)
+            if task and not task.done():
+                task.cancel()
+
+        for w_key, task in list(self.account_workers.items()):
+            if w_key in all_ids or any(w_key.startswith(i) or i.startswith(w_key) for i in all_ids if len(i) >= 6):
+                if not task.done():
+                    task.cancel()
+                self.account_workers.pop(w_key, None)
+
+        # 5. Remove from runtime dictionaries
+        for i in all_ids:
+            self.accounts.pop(i, None)
+            self.error_accounts.pop(i, None)
+            self.account_credentials.pop(i, None)
+            self.account_stop_events.pop(i, None)
+
+        self.recalc_totals()
+        return all_ids
 
     def register_error_account(self, uid: str, reason: str, auth_type: str = "guest", details: Optional[Dict[str, Any]] = None):
         uid_str = str(uid).strip()
@@ -382,33 +500,36 @@ async def handle_delete_account(request: web.Request) -> web.Response:
         data = await request.json()
         uid = str(data.get("uid")).strip()
 
-        # Serialize file mutations to prevent concurrent add/delete requests
-        # from overwriting each other's changes. Disk I/O itself is off-loop.
+        # Stop worker tasks, set stop events, close sockets, and mark as permanently dead in memory
+        all_ids = bot_state.stop_and_purge_account(uid)
+
+        # Invalidate credential cache for all linked identifiers
+        if "on_cache_invalidate" in bot_state.refresh_callbacks:
+            for i in all_ids:
+                try:
+                    bot_state.refresh_callbacks["on_cache_invalidate"](i)
+                except Exception:
+                    pass
+
+        # Serialize removal from accounts.json across all aliases (auth_uid, acc_id, token)
         async with request.app["accounts_lock"]:
             exists = await _run_dashboard_io(request.app, os.path.exists, ACCOUNTS_FILE)
             if exists:
                 existing = await _run_dashboard_io(request.app, _read_accounts_file)
-                existing = [
-                    acc for acc in existing
-                    if not isinstance(acc, dict)
-                    or (str(acc.get("uid", "")).strip() != uid and str(acc.get("token", ""))[:20].strip() != uid and str(acc.get("token", "")).strip() != uid)
-                ]
-                await _run_dashboard_io(request.app, _write_accounts_file, existing)
+                new_list = []
+                for acc in existing:
+                    if not isinstance(acc, dict):
+                        continue
+                    a_uid = str(acc.get("uid", "")).strip()
+                    a_tok = str(acc.get("token", "")).strip()
+                    # Check if entry matches any linked alias or original input
+                    if (a_uid and (a_uid in all_ids or a_uid == uid)) or (a_tok and (a_tok in all_ids or a_tok[:20] in all_ids or a_tok[:10] in all_ids or a_tok == uid)):
+                        continue
+                    new_list.append(acc)
+                await _run_dashboard_io(request.app, _write_accounts_file, new_list)
 
-        if uid in bot_state.accounts:
-            del bot_state.accounts[uid]
-
-        if uid in bot_state.error_accounts:
-            del bot_state.error_accounts[uid]
-
-        # Stop worker task if running
-        for w_key in list(bot_state.account_workers.keys()):
-            if w_key == uid or (len(w_key) >= 10 and uid.startswith(w_key)):
-                bot_state.account_workers[w_key].cancel()
-                del bot_state.account_workers[w_key]
-
-        bot_state.log(f"Account {uid} permanently removed", "warning", uid)
-        return web.json_response({"status": "ok", "deleted_uid": uid})
+        bot_state.log(f"Account {uid} permanently killed & removed from backend (1000% stopped)", "warning", uid)
+        return web.json_response({"status": "ok", "deleted_uid": uid, "all_ids": list(all_ids)})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
 
@@ -416,42 +537,40 @@ async def handle_delete_account(request: web.Request) -> web.Response:
 async def handle_delete_error_accounts(request: web.Request) -> web.Response:
     """Permanently delete all quarantined error accounts from accounts.json, runtime state, and workers."""
     try:
-        error_uids = set(str(k).strip() for k in bot_state.error_accounts.keys())
+        error_uids = list(bot_state.error_accounts.keys())
         if not error_uids:
             return web.json_response({"status": "ok", "deleted_count": 0, "message": "No error accounts to delete"})
+
+        all_purged_ids = set()
+        for e_uid in error_uids:
+            purged = bot_state.stop_and_purge_account(e_uid)
+            all_purged_ids.update(purged)
+
+        if "on_cache_invalidate" in bot_state.refresh_callbacks:
+            for i in all_purged_ids:
+                try:
+                    bot_state.refresh_callbacks["on_cache_invalidate"](i)
+                except Exception:
+                    pass
 
         async with request.app["accounts_lock"]:
             exists = await _run_dashboard_io(request.app, os.path.exists, ACCOUNTS_FILE)
             if exists:
                 existing = await _run_dashboard_io(request.app, _read_accounts_file)
-                # Filter out any account whose uid or token matches any quarantined error uid
                 new_list = []
                 for acc in existing:
                     if not isinstance(acc, dict):
                         continue
                     a_uid = str(acc.get("uid", "")).strip()
                     a_tok = str(acc.get("token", "")).strip()
-                    a_tok_prefix = a_tok[:20]
-                    a_tok_short = a_tok[:10]
-                    if (a_uid and a_uid in error_uids) or (a_tok and (a_tok in error_uids or a_tok_prefix in error_uids or a_tok_short in error_uids)):
+                    if (a_uid and a_uid in all_purged_ids) or (a_tok and (a_tok in all_purged_ids or a_tok[:20] in all_purged_ids or a_tok[:10] in all_purged_ids)):
                         continue
                     new_list.append(acc)
                 await _run_dashboard_io(request.app, _write_accounts_file, new_list)
 
-        # Cancel all workers associated with error accounts
-        cancelled_workers = 0
-        for uid in error_uids:
-            if uid in bot_state.accounts:
-                del bot_state.accounts[uid]
-            for w_key in list(bot_state.account_workers.keys()):
-                if w_key == uid or (len(w_key) >= 10 and uid.startswith(w_key)):
-                    bot_state.account_workers[w_key].cancel()
-                    del bot_state.account_workers[w_key]
-                    cancelled_workers += 1
-
         deleted_count = len(error_uids)
         bot_state.error_accounts.clear()
-        bot_state.log(f"🗑️ Realtime Deletion: {deleted_count} error accounts purged from disk and memory (1000% clean)", "success")
+        bot_state.log(f"🗑️ Realtime Deletion: {deleted_count} error accounts purged from disk and memory (1000% stopped)", "success")
         return web.json_response({"status": "ok", "deleted_count": deleted_count})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})

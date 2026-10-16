@@ -1588,8 +1588,8 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
     try:
         while True:
-            if stop_event and stop_event.is_set():
-                log_info(f"[{uid_str}] Worker Thread #{worker_id} stopping cleanly.")
+            if bot_state.is_deleted(uid_str) or (stop_event and stop_event.is_set()):
+                log_info(f"[{uid_str}] Worker Thread #{worker_id} stopping cleanly (account deleted/stopped).")
                 break
 
             # Check if account is paused
@@ -1599,6 +1599,8 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
             writer = None
             try:
+                if bot_state.is_deleted(uid_str):
+                    break
                 if current_account_data:
                     fresh = None
                     if current_account_data.get('auth_type') == 'guest' and current_account_data.get('auth_uid'):
@@ -1632,6 +1634,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
                 resolved_ip = await resolve_host_cloudflare(ip)
                 reader, writer = await asyncio.open_connection(resolved_ip, int(port))
+                bot_state.register_writer(uid_str, writer)
 
                 raw_sock = writer.get_extra_info('socket')
                 if raw_sock:
@@ -1691,6 +1694,15 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                         )
                     except Exception:
                         pass
+
+                    if bot_state.is_deleted(uid_str) or (stop_event and stop_event.is_set()):
+                        log_info(f"[{uid_str}] Account deleted/stopped - aborting read loop.")
+                        if writer:
+                            try:
+                                writer.close()
+                            except Exception:
+                                pass
+                        break
 
                     now = asyncio.get_running_loop().time()
                     if HUMAN_MODE:
@@ -1869,10 +1881,15 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
                 if writer:
                     try:
+                        bot_state.unregister_writer(uid_str, writer)
                         writer.close()
                         await writer.wait_closed()
                     except Exception:
                         pass
+
+                if bot_state.is_deleted(uid_str) or (stop_event and stop_event.is_set()):
+                    log_info(f"[{uid_str}] Account deleted/stopped. Terminating worker loop.")
+                    break
 
                 if "Cache expired" in str(e):
                     log_warn(f"Triggering re-login for {uid_str}")
@@ -1886,6 +1903,12 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                     continue
 
                 await asyncio.sleep(min(reconnects, 2))
+            finally:
+                if writer:
+                    try:
+                        bot_state.unregister_writer(uid_str, writer)
+                    except Exception:
+                        pass
 
     except asyncio.CancelledError:
         log_warn(f"Outer cancelled. {len(play_matches)} UDP matches still running.")
@@ -2097,7 +2120,14 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
         if majorlogin_response.region and majorlogin_response.region.upper() not in ("ID",):
             region = majorlogin_response.region
 
+        # Link in-game account_id and login uid so deleting either will kill everything
+        bot_state.link_account_ids(acc_id, uid)
+        if uid in bot_state.account_workers:
+            bot_state.account_workers[acc_id] = bot_state.account_workers[uid]
+
         bot_state.register_account(uid=acc_id, nickname=nickname, region=region, level=level, exp=exp, likes=likes)
+        if acc_id in bot_state.accounts:
+            bot_state.accounts[acc_id]["auth_uid"] = uid
 
         log_ok(f"Login success | UID: {acc_id} | {nickname} | Lvl {level} | EXP: {exp:,}")
 
@@ -2221,7 +2251,14 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
         if majorlogin_response.region and majorlogin_response.region.upper() not in ("ID",):
             region = majorlogin_response.region
 
+        # Link token and in-game account_id
+        bot_state.link_account_ids(acc_id, access_token, access_token[:20], access_token[:10])
+        if access_token[:10] in bot_state.account_workers:
+            bot_state.account_workers[acc_id] = bot_state.account_workers[access_token[:10]]
+
         bot_state.register_account(uid=acc_id, nickname=nickname, region=region, level=level, exp=exp, likes=likes)
+        if acc_id in bot_state.accounts:
+            bot_state.accounts[acc_id]["token"] = access_token
 
         log_ok(f"Token login OK | UID: {acc_id} | {nickname} | Lvl {level} | EXP: {exp:,}")
 
@@ -2261,6 +2298,9 @@ async def run_account_worker(account_data: Dict, label: str):
     acc_id = str(account_data['account_id'])
     informational_task = None
     exp_task = None
+    account_stop_ev = asyncio.Event()
+    bot_state.register_stop_event(acc_id, account_stop_ev)
+    bot_state.register_stop_event(label, account_stop_ev)
     try:
         reg = "IND"
         if account_data.get('region') and account_data['region'].upper() not in ("ID",):
@@ -2299,6 +2339,8 @@ async def run_account_worker(account_data: Dict, label: str):
         async def exp_refresher():
             while True:
                 await asyncio.sleep(90)
+                if bot_state.is_deleted(acc_id) or bot_state.is_deleted(label):
+                    break
                 fresh = bot_state.account_credentials.get(acc_id)
                 if fresh:
                     await refresh_account_profile(fresh)
@@ -2310,6 +2352,15 @@ async def run_account_worker(account_data: Dict, label: str):
 
         async def worker_supervisor():
             while True:
+                if bot_state.is_deleted(acc_id) or bot_state.is_deleted(label) or account_stop_ev.is_set():
+                    log_warn(f"[{acc_id}] Account deleted/purged. Worker supervisor stopping all threads.")
+                    for s in list(worker_stop_events.values()):
+                        s.set()
+                    for t in list(worker_tasks.values()):
+                        if not t.done():
+                            t.cancel()
+                    break
+
                 desired = getattr(bot_state, "game_workers", 3)
 
                 # Pause check
@@ -2388,6 +2439,9 @@ async def run_account_worker(account_data: Dict, label: str):
 async def account_loop_guest(uid: str, password: str):
     uid_str = str(uid).strip()
     while True:
+        if bot_state.is_deleted(uid_str):
+            log_warn(f"Account {uid_str} is deleted/purged. Permanently terminating guest loop.")
+            break
         try:
             log_login(f"Starting login for Guest UID: {uid_str}")
             try:
@@ -2402,6 +2456,8 @@ async def account_loop_guest(uid: str, password: str):
                     bot_state.register_error_account(uid_str, "Login rejected (Invalid credentials or blocked)", auth_type="guest")
                 except Exception:
                     pass
+                if bot_state.is_deleted(uid_str):
+                    break
                 await asyncio.sleep(15)
                 continue
 
@@ -2412,6 +2468,8 @@ async def account_loop_guest(uid: str, password: str):
                 pass
 
             await run_account_worker(account_data, uid_str)
+            if bot_state.is_deleted(uid_str):
+                break
             log_warn(f"Session finished for {uid_str}. Reconnect in 3s...")
             await asyncio.sleep(3)
         except asyncio.CancelledError:
@@ -2422,6 +2480,8 @@ async def account_loop_guest(uid: str, password: str):
                 pass
             break
         except Exception as e:
+            if bot_state.is_deleted(uid_str):
+                break
             err_msg = f"Runtime error: {e}"
             log_err(f"Error for UID {uid_str}: {e}. Retry in 10s...")
             try:
@@ -2435,6 +2495,9 @@ async def account_loop_token(token: str):
     token_str = str(token).strip()
     token_label = token_str[:10]
     while True:
+        if bot_state.is_deleted(token_str) or bot_state.is_deleted(token_label):
+            log_warn(f"Token {token_label} is deleted/purged. Permanently terminating token loop.")
+            break
         try:
             log_login("Starting login with Access Token...")
             account_data = await process_account_token(token_str)
@@ -2445,6 +2508,8 @@ async def account_loop_token(token: str):
                     bot_state.register_error_account(token_label, "Token expired or invalid", auth_type="token")
                 except Exception:
                     pass
+                if bot_state.is_deleted(token_str) or bot_state.is_deleted(token_label):
+                    break
                 await asyncio.sleep(15)
                 continue
 
@@ -2456,12 +2521,16 @@ async def account_loop_token(token: str):
                 pass
 
             await run_account_worker(account_data, acc_id)
+            if bot_state.is_deleted(token_str) or bot_state.is_deleted(token_label) or bot_state.is_deleted(acc_id):
+                break
             log_warn("Token session finished. Reconnect in 3s...")
             await asyncio.sleep(3)
         except asyncio.CancelledError:
             log_warn(f"Worker for token {token_label} stopped.")
             break
         except Exception as e:
+            if bot_state.is_deleted(token_str) or bot_state.is_deleted(token_label):
+                break
             err_msg = f"Token runtime error: {e}"
             log_err(f"Token error: {e}. Retry in 10s...")
             try:
@@ -2525,6 +2594,7 @@ async def main():
 
     bot_state.refresh_callbacks["on_account_added"] = on_account_added_handler
     bot_state.refresh_callbacks["on_refresh_account"] = on_refresh_account_handler
+    bot_state.refresh_callbacks["on_cache_invalidate"] = cache_invalidate
 
     accounts = load_accounts()
 
