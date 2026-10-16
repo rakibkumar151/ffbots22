@@ -40,7 +40,7 @@ from proxy_manager import proxy_mgr
 
 # ==================== CONFIGURATION ====================
 WEB_HOST = "0.0.0.0"
-WEB_PORT = 20030
+WEB_PORT = 20336
 ACCOUNTS_FILE = "accounts.json"
 TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"
@@ -666,22 +666,17 @@ async def get_access_token(uid, password):
         "client_id": "100067"
     }
     # 1. ALWAYS TRY DIRECT FIRST (Zero proxy usage to save paneer bandwidth & balance)
-    for attempt in range(4):
-        try:
-            response = await client.post(url, headers=hdrs, data=data)
-            if response.status_code == 200:
-                response_data = response.json()
-                open_id = response_data.get("open_id")
-                access_token = response_data.get("access_token")
-                platform = response_data.get("platform", 4)
-                if open_id and access_token:
-                    return open_id, access_token, platform
-            if response.status_code == 429:
-                await asyncio.sleep(1)
-                continue
-        except Exception:
-            pass
-        await asyncio.sleep(0.4)
+    try:
+        response = await asyncio.wait_for(client.post(url, headers=hdrs, data=data), timeout=2.5)
+        if response.status_code == 200:
+            response_data = response.json()
+            open_id = response_data.get("open_id")
+            access_token = response_data.get("access_token")
+            platform = response_data.get("platform", 4)
+            if open_id and access_token:
+                return open_id, access_token, platform
+    except Exception:
+        pass
 
     # 2. ONLY IF DIRECT LOGIN FAILED AND PROXY IS ENABLED: FALLBACK WITH RANDOMIZED SID
     if proxy_mgr.is_enabled():
@@ -878,7 +873,7 @@ async def send_majorlogin(data, release_version, server_url):
         
         response = None
         try:
-            response = await client.post(url, headers=req_headers, data=data)
+            response = await asyncio.wait_for(client.post(url, headers=req_headers, data=data), timeout=3.0)
         except Exception as e:
             log_err(f"[MajorLogin] Direct connection error: {e}")
 
@@ -958,7 +953,7 @@ async def send_getlogin(data, base_url, token, release_version):
         
         response = None
         try:
-            response = await client.post(url, headers=req_headers, data=data)
+            response = await asyncio.wait_for(client.post(url, headers=req_headers, data=data), timeout=3.0)
         except Exception as e:
             log_err(f"[GetLoginData] Direct connection error: {e}")
 
@@ -1061,7 +1056,7 @@ async def start_game_lone_wolf(region, client_version, writer, key, iv):
     hex_length = hex(packet_length)[2:]
     hex_length = hex_length if len(hex_length) > 1 else "0" + hex_length
     reg = str(region).upper() if region else "IND"
-    reg_prefix = "031400"
+    reg_prefix = "031900" if reg == "ID" else ("031400" if reg in ("IND", "IN") else "031500")
     final_packet = reg_prefix + "0" * (6 - len(hex_length)) + hex_length + encrypted_packet
     writer.write(bytes.fromhex(final_packet))
     await writer.drain()
@@ -1797,6 +1792,19 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                     packet_length = len(data)
                     no_response_count = 0
 
+                    if hex_data.startswith("0b00"):
+                        err_code = 11
+                        try:
+                            parsed_p = Parser().parse(hex_data[10:])
+                            for r in parsed_p:
+                                if r.field == 2:
+                                    err_code = r.data
+                        except Exception:
+                            pass
+                        log_warn(f"[{uid_str}] Match queue notice from server (Code: {err_code}). Retrying in 8s...")
+                        await asyncio.sleep(8)
+                        continue
+
                     if hex_data.startswith("0300") and 10 < packet_length < 30:
                         log_info(f"[Worker #{worker_id}] Match starting, please wait...")
                         continue
@@ -2438,91 +2446,38 @@ async def run_account_worker(account_data: Dict, label: str):
 
         exp_task = asyncio.create_task(exp_refresher())
 
-        worker_tasks: Dict[int, asyncio.Task] = {}
-        worker_stop_events: Dict[int, asyncio.Event] = {}
-
-        async def worker_supervisor():
-            while True:
-                if bot_state.is_deleted(acc_id) or bot_state.is_deleted(label) or account_stop_ev.is_set():
-                    log_warn(f"[{acc_id}] Account deleted/purged. Worker supervisor stopping all threads.")
-                    for s in list(worker_stop_events.values()):
-                        s.set()
-                    for t in list(worker_tasks.values()):
-                        if not t.done():
-                            t.cancel()
-                    break
-
-                desired = getattr(bot_state, "game_workers", 3)
-
-                # Pause check
-                is_p = acc_id in bot_state.accounts and bot_state.accounts[acc_id].get("is_paused")
-                if is_p:
-                    for s in list(worker_stop_events.values()):
-                        s.set()
-                    await asyncio.sleep(2)
-                    continue
-
-                # Remove finished tasks
-                dead = [wid for wid, t in worker_tasks.items() if t.done()]
-                for wid in dead:
-                    del worker_tasks[wid]
-                    if wid in worker_stop_events:
-                        del worker_stop_events[wid]
-
-                # Spawn workers up to desired count
-                for wid in range(1, desired + 1):
-                    if wid not in worker_tasks or worker_tasks[wid].done():
-                        stop_ev = asyncio.Event()
-                        worker_stop_events[wid] = stop_ev
-                        t = asyncio.create_task(
-                            functional_lone_wolf(
-                                account_data['functional_addrs'],
-                                tcp_packet_online,
-                                reg,
-                                account_data['client_version'],
-                                account_data['aes_ak'],
-                                account_data['iv_i'],
-                                account_id=acc_id,
-                                account_data=account_data,
-                                worker_id=wid,
-                                stop_event=stop_ev
-                            )
-                        )
-                        worker_tasks[wid] = t
-                        log_ok(f"[{acc_id}] Worker Thread #{wid} launched -> starting match search")
-                        if wid < desired:
-                            await asyncio.sleep(1.5)
-
-                # Stop workers above desired limit
-                excess = [wid for wid in list(worker_tasks.keys()) if wid > desired]
-                for wid in excess:
-                    if wid in worker_stop_events:
-                        worker_stop_events[wid].set()
-
-                try:
-                    await asyncio.wait_for(bot_state.worker_event.wait(), timeout=3.0)
-                    bot_state.worker_event.clear()
-                except asyncio.TimeoutError:
-                    pass
-
-        supervisor_task = asyncio.create_task(worker_supervisor())
-        await supervisor_task
+        lone_wolf_task = asyncio.create_task(
+            functional_lone_wolf(
+                account_data['functional_addrs'],
+                tcp_packet_online,
+                reg,
+                account_data['client_version'],
+                account_data['aes_ak'],
+                account_data['iv_i'],
+                account_id=acc_id,
+                account_data=account_data,
+                worker_id=1,
+                stop_event=account_stop_ev
+            )
+        )
+        await lone_wolf_task
 
     except asyncio.CancelledError:
         raise
     except Exception as e:
         log_err(f"run_account_worker [{label}]: {e}")
     finally:
-        for t in list(worker_tasks.values()):
-            if not t.done():
-                t.cancel()
+        if lone_wolf_task and not lone_wolf_task.done():
+            lone_wolf_task.cancel()
         for t in (informational_task, exp_task):
             if t and not t.done():
                 t.cancel()
-        for t in (informational_task, exp_task):
+        for t in (informational_task, exp_task, lone_wolf_task):
             if t:
                 try:
                     await t
+                except (asyncio.CancelledError, Exception):
+                    pass
                 except (asyncio.CancelledError, Exception):
                     pass
 
