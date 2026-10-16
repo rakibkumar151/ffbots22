@@ -1653,9 +1653,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
     current_iv = iv
     current_account_data = account_data
 
-    forced_region = FORCE_REGION
-    if account_region and account_region.upper() not in ("IND", "IN", "ID"):
-        forced_region = account_region.upper()
+    forced_region = account_region.upper() if (account_region and account_region.strip()) else FORCE_REGION
 
     try:
         while True:

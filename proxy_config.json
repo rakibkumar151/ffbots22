@@ -6,11 +6,11 @@
   "password": "2a2a28c71ef01122",
   "protocol": "http",
   "stats": {
-    "total_fallback_attempts": 4,
-    "total_fallback_successes": 0,
-    "last_used_time": "2026-10-16 23:00:30",
+    "total_fallback_attempts": 5,
+    "total_fallback_successes": 1,
+    "last_used_time": "2026-10-16 23:19:14",
     "last_assigned_ip": "73.173.85.144",
-    "last_used_sid": "89198652",
+    "last_used_sid": "74283482",
     "last_test_result": {
       "ok": true,
       "ip": "73.173.85.144",

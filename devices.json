@@ -16,5 +16,23 @@
         "build_fingerprint": "samsung/sm-g998b/sm-g998b:Android_OS_12/user/release-keys",
         "serial_number": "8674b8e34b9a18f6",
         "hardware_id": "2ee42d1aacbcbc84"
+    },
+    "8295259226": {
+        "unique_device_id": "Google|78c1fafc-3320-40e9-9c95-dd988a9915ff",
+        "brand": "Xiaomi",
+        "model": "2201122G",
+        "gpu_renderer": "Adreno (TM) 730",
+        "system_software": "Android OS 13 / API-33",
+        "screen_width": 1440,
+        "screen_height": 2400,
+        "screen_dpi": "389",
+        "memory": 4923,
+        "processor_details": "ARM64 FP ASIMD AES VMH | 2819 | 12",
+        "client_ip": "104.88.246.72",
+        "android_id": "99e9f30f3f76a544",
+        "gsf_id": "50fc441cb54c3de0",
+        "build_fingerprint": "xiaomi/2201122g/2201122g:Android_OS_13/user/release-keys",
+        "serial_number": "f2d0e9e52a478bb1",
+        "hardware_id": "0a2ec00dfe529007"
     }
 }
