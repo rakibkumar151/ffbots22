@@ -34,8 +34,9 @@ from message_ids import MESSAGE_ID_TO_NAME
 import MasterTeam_pb2
 import MasterFF_pb2
 
-# ==================== WEB DASHBOARD ====================
+# ==================== WEB DASHBOARD & PROXY ====================
 from dashboard_server import bot_state, start_web_dashboard
+from proxy_manager import proxy_mgr
 
 # ==================== CONFIGURATION ====================
 WEB_HOST = "0.0.0.0"
@@ -664,7 +665,8 @@ async def get_access_token(uid, password):
         "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
         "client_id": "100067"
     }
-    for attempt in range(5):
+    # 1. ALWAYS TRY DIRECT FIRST (Zero proxy usage to save paneer bandwidth & balance)
+    for attempt in range(4):
         try:
             response = await client.post(url, headers=hdrs, data=data)
             if response.status_code == 200:
@@ -679,7 +681,35 @@ async def get_access_token(uid, password):
                 continue
         except Exception:
             pass
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.4)
+
+    # 2. ONLY IF DIRECT LOGIN FAILED AND PROXY IS ENABLED: FALLBACK WITH RANDOMIZED SID
+    if proxy_mgr.is_enabled():
+        log_login(f"Direct token grant failed for UID {uid}. Attempting fallback via proxy...")
+        for p_attempt in range(2):
+            proxy_url, sid = proxy_mgr.generate_proxy_url()
+            if not proxy_url:
+                break
+            try:
+                log_login(f"Proxy Fallback (SID: {sid}) attempt {p_attempt + 1}/2 for UID {uid}...")
+                async with httpx.AsyncClient(proxy=proxy_url, verify=False, timeout=12.0) as proxy_client:
+                    response = await proxy_client.post(url, headers=hdrs, data=data)
+                    if response.status_code == 200:
+                        response_data = response.json()
+                        open_id = response_data.get("open_id")
+                        access_token = response_data.get("access_token")
+                        platform = response_data.get("platform", 4)
+                        if open_id and access_token:
+                            proxy_mgr.record_success(sid)
+                            log_ok(f"Proxy Fallback Login SUCCESS for UID {uid} [SID: {sid}]")
+                            bot_state.log(f"🛡️ Proxy login fallback success for UID {uid} (SID: {sid})", "success")
+                            return open_id, access_token, platform
+                    elif response.status_code == 429:
+                        await asyncio.sleep(1.0)
+            except Exception as pe:
+                log_err(f"Proxy attempt with SID {sid} error: {pe}")
+            await asyncio.sleep(0.5)
+
     return None
 
 
@@ -845,10 +875,31 @@ async def send_majorlogin(data, release_version, server_url):
 
         req_headers = headers.copy()
         req_headers["ReleaseVersion"] = release_version
-        response = await client.post(url, headers=req_headers, data=data)
+        
+        response = None
+        try:
+            response = await client.post(url, headers=req_headers, data=data)
+        except Exception as e:
+            log_err(f"[MajorLogin] Direct connection error: {e}")
 
-        if response.status_code != 200:
-            log_err(f"[MajorLogin] HTTP {response.status_code}")
+        # If direct attempt failed and proxy is enabled: fallback with randomized SID
+        if (response is None or response.status_code != 200 or len(response.content) < 40) and proxy_mgr.is_enabled():
+            proxy_url, sid = proxy_mgr.generate_proxy_url()
+            if proxy_url:
+                log_login(f"[MajorLogin] Fallback attempt via Proxy (SID: {sid})...")
+                try:
+                    async with httpx.AsyncClient(proxy=proxy_url, verify=False, timeout=12.0) as proxy_client:
+                        p_resp = await proxy_client.post(url, headers=req_headers, data=data)
+                        if p_resp.status_code == 200 and len(p_resp.content) >= 40:
+                            response = p_resp
+                            proxy_mgr.record_success(sid)
+                            log_ok(f"[MajorLogin] Proxy Fallback SUCCESS [SID: {sid}]")
+                except Exception as pe:
+                    log_err(f"[MajorLogin] Proxy fallback error: {pe}")
+
+        if response is None or response.status_code != 200:
+            status = response.status_code if response else "No response"
+            log_err(f"[MajorLogin] HTTP {status}")
             return None
 
         response_content = response.content
@@ -904,10 +955,30 @@ async def send_getlogin(data, base_url, token, release_version):
         req_headers["ReleaseVersion"] = release_version
         req_headers['Authorization'] = f"Bearer {token}"
         req_headers['Host'] = "clientbp.ppmainecoonghj.com"
-        response = await client.post(url, headers=req_headers, data=data)
+        
+        response = None
+        try:
+            response = await client.post(url, headers=req_headers, data=data)
+        except Exception as e:
+            log_err(f"[GetLoginData] Direct connection error: {e}")
 
-        if response.status_code != 200:
-            log_err(f"[GetLoginData] HTTP {response.status_code}")
+        # If direct attempt failed and proxy is enabled: fallback with randomized SID
+        if (response is None or response.status_code != 200) and proxy_mgr.is_enabled():
+            proxy_url, sid = proxy_mgr.generate_proxy_url()
+            if proxy_url:
+                try:
+                    async with httpx.AsyncClient(proxy=proxy_url, verify=False, timeout=12.0) as proxy_client:
+                        p_resp = await proxy_client.post(url, headers=req_headers, data=data)
+                        if p_resp.status_code == 200:
+                            response = p_resp
+                            proxy_mgr.record_success(sid)
+                            log_ok(f"[GetLoginData] Proxy Fallback SUCCESS [SID: {sid}]")
+                except Exception as pe:
+                    log_err(f"[GetLoginData] Proxy fallback error: {pe}")
+
+        if response is None or response.status_code != 200:
+            status = response.status_code if response else "No response"
+            log_err(f"[GetLoginData] HTTP {status}")
             return None
 
         response_content = response.content
@@ -2201,8 +2272,30 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
             "Host": "100067.connect.garena.com",
             "User-Agent": "GarenaMSDK/4.0.19P4(G011A ;Android 9;en;US;)"
         }
-        resp = await asyncio.to_thread(requests.get, url, headers=hdrs, timeout=10)
-        data = resp.json()
+        resp = None
+        data = {}
+        try:
+            resp = await asyncio.to_thread(requests.get, url, headers=hdrs, timeout=10)
+            data = resp.json()
+        except Exception as e:
+            log_err(f"Direct token inspect error: {e}")
+
+        # If direct token inspect failed and proxy is enabled: fallback with randomized SID
+        if (resp is None or 'error' in data or not data.get('open_id')) and proxy_mgr.is_enabled():
+            proxy_url, sid = proxy_mgr.generate_proxy_url()
+            if proxy_url:
+                try:
+                    log_login(f"Proxy Fallback (SID: {sid}) for token inspect...")
+                    proxies = {'http': proxy_url, 'https': proxy_url}
+                    p_resp = await asyncio.to_thread(requests.get, url, headers=hdrs, proxies=proxies, timeout=12)
+                    p_data = p_resp.json()
+                    if 'error' not in p_data and p_data.get('open_id'):
+                        resp = p_resp
+                        data = p_data
+                        proxy_mgr.record_success(sid)
+                        log_ok(f"Proxy Token Inspect SUCCESS [SID: {sid}]")
+                except Exception as pe:
+                    log_err(f"Proxy token inspect error: {pe}")
 
         if 'error' in data:
             log_err(f"Token inspect error: {data.get('error')}")

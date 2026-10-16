@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Dict, List, Any, Optional, Set
 from aiohttp import web
+from proxy_manager import proxy_mgr, parse_proxy_string
 
 # ==================== PATHS ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -439,7 +440,8 @@ async def handle_get_stats(request: web.Request) -> web.Response:
         "error_accounts": err_list,
         "total_error_accounts": len(err_list),
         "logs": bot_state.logs[-60:],
-        "uptime": int(time.time() - bot_state.start_time)
+        "uptime": int(time.time() - bot_state.start_time),
+        "proxy": proxy_mgr.get_summary()
     })
 
 
@@ -465,6 +467,66 @@ async def handle_set_workers(request: web.Request) -> web.Response:
         })
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
+
+
+async def handle_get_proxy(request: web.Request) -> web.Response:
+    return web.json_response({
+        "status": "ok",
+        "proxy": proxy_mgr.get_summary()
+    })
+
+
+async def handle_update_proxy(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        proxy_str = data.get("proxy_str")
+        enabled = data.get("enabled")
+        if proxy_str:
+            summary = proxy_mgr.update_from_string(proxy_str, enabled=enabled)
+        else:
+            host = data.get("host", "")
+            port = data.get("port", 8080)
+            user = data.get("user", "")
+            password = data.get("password", "")
+            protocol = data.get("protocol", "http")
+            summary = proxy_mgr.update_config(host, port, user, password, protocol, enabled=enabled)
+        
+        status_txt = "ENABLED (Login Fallback)" if summary.get("enabled") else "DISABLED (Direct Only)"
+        bot_state.log(f"🛡️ Proxy configuration updated: {summary.get('host')}:{summary.get('port')} [{status_txt}]", "info")
+        return web.json_response({"status": "ok", "proxy": summary})
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)})
+
+
+async def handle_toggle_proxy(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        enabled = bool(data.get("enabled", False))
+        res = proxy_mgr.set_enabled(enabled)
+        status_txt = "ON (Fallback Active)" if res else "OFF (Direct Only - 0 Proxy Usage)"
+        bot_state.log(f"⚡ Proxy Guard switched {status_txt}", "success" if res else "warning")
+        return web.json_response({"status": "ok", "enabled": res, "proxy": proxy_mgr.get_summary()})
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)})
+
+
+async def handle_test_proxy(request: web.Request) -> web.Response:
+    try:
+        data = await request.json() if request.can_read_body else {}
+        test_str = data.get("proxy_str")
+        if test_str:
+            # Temporarily apply or parse string for test
+            parsed = parse_proxy_string(test_str)
+            if parsed.get("host"):
+                proxy_mgr.update_from_string(test_str)
+        result = await proxy_mgr.test_connection()
+        if result.get("ok"):
+            bot_state.log(f"✅ Proxy test passed! IP: {result.get('ip')} ({result.get('latency_ms')}ms)", "success")
+        else:
+            bot_state.log(f"❌ Proxy test failed: {result.get('error')}", "error")
+        return web.json_response(result)
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)})
 
 
 async def handle_add_account(request: web.Request) -> web.Response:
@@ -681,6 +743,10 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 20333):
     app.router.add_get("/api/stats", handle_get_stats)
     app.router.add_get("/api/workers", handle_get_workers)
     app.router.add_post("/api/workers/set", handle_set_workers)
+    app.router.add_get("/api/proxy", handle_get_proxy)
+    app.router.add_post("/api/proxy/update", handle_update_proxy)
+    app.router.add_post("/api/proxy/toggle", handle_toggle_proxy)
+    app.router.add_post("/api/proxy/test", handle_test_proxy)
     app.router.add_post("/api/account/add", handle_add_account)
     app.router.add_post("/api/account/delete", handle_delete_account)
     app.router.add_post("/api/account/delete_errors", handle_delete_error_accounts)
