@@ -1,4 +1,4 @@
 {
-  "game_workers": 5,
+  "game_workers": 1,
   "dashboard_io_workers": 2
 }

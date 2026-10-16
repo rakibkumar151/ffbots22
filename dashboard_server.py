@@ -48,8 +48,39 @@ class BotState:
         self.account_workers: Dict[str, asyncio.Task] = {}
         self.refresh_callbacks: Dict[str, Any] = {}
         self.account_credentials: Dict[str, Dict[str, Any]] = {}
+        self.error_accounts: Dict[str, Dict[str, Any]] = {}
         self.game_workers: int = _load_game_worker_count()
         self.worker_event: asyncio.Event = asyncio.Event()
+
+    def register_error_account(self, uid: str, reason: str, auth_type: str = "guest", details: Optional[Dict[str, Any]] = None):
+        uid_str = str(uid).strip()
+        if not uid_str:
+            return
+        now_str = time.strftime("%H:%M:%S")
+        existing = self.error_accounts.get(uid_str)
+        err_count = (existing.get("error_count", 0) + 1) if existing else 1
+        entry = {
+            "uid": uid_str,
+            "reason": str(reason),
+            "auth_type": auth_type,
+            "error_count": err_count,
+            "first_seen": existing.get("first_seen", now_str) if existing else now_str,
+            "last_seen": now_str,
+            "details": details or {}
+        }
+        self.error_accounts[uid_str] = entry
+        if uid_str in self.accounts:
+            self.accounts[uid_str]["status"] = "ERROR"
+            self.accounts[uid_str]["error_reason"] = str(reason)
+            self.accounts[uid_str]["last_updated"] = now_str
+        self.log(f"⚠️ [Error Node Quarantine] UID {uid_str}: {reason}", "error", uid_str)
+
+    def clear_error_account(self, uid: str):
+        uid_str = str(uid).strip()
+        if uid_str in self.error_accounts:
+            del self.error_accounts[uid_str]
+        if uid_str in self.accounts:
+            self.accounts[uid_str].pop("error_reason", None)
 
     def set_game_workers(self, count: int) -> int:
         self.game_workers = max(1, min(20, int(count)))
@@ -266,6 +297,8 @@ async def handle_index(request: web.Request) -> web.Response:
 async def handle_get_stats(request: web.Request) -> web.Response:
     accounts_data = list(bot_state.accounts.values())
     accounts_data.sort(key=lambda x: x.get("gained_exp", 0), reverse=True)
+    err_list = list(bot_state.error_accounts.values())
+    err_list.sort(key=lambda x: x.get("last_seen", ""), reverse=True)
     return web.json_response({
         "total_accounts": len(bot_state.accounts),
         "total_matches": bot_state.total_matches,
@@ -275,6 +308,8 @@ async def handle_get_stats(request: web.Request) -> web.Response:
         "game_workers": getattr(bot_state, "game_workers", 3),
         "exp_per_hour": bot_state.get_exp_per_hour(),
         "accounts": accounts_data,
+        "error_accounts": err_list,
+        "total_error_accounts": len(err_list),
         "logs": bot_state.logs[-60:],
         "uptime": int(time.time() - bot_state.start_time)
     })
@@ -356,19 +391,82 @@ async def handle_delete_account(request: web.Request) -> web.Response:
                 existing = [
                     acc for acc in existing
                     if not isinstance(acc, dict)
-                    or (str(acc.get("uid")) != uid and str(acc.get("token", ""))[:20] != uid)
+                    or (str(acc.get("uid", "")).strip() != uid and str(acc.get("token", ""))[:20].strip() != uid and str(acc.get("token", "")).strip() != uid)
                 ]
                 await _run_dashboard_io(request.app, _write_accounts_file, existing)
 
         if uid in bot_state.accounts:
             del bot_state.accounts[uid]
 
-        if uid in bot_state.account_workers:
-            bot_state.account_workers[uid].cancel()
-            del bot_state.account_workers[uid]
+        if uid in bot_state.error_accounts:
+            del bot_state.error_accounts[uid]
 
-        bot_state.log(f"Account {uid} removed", "warning", uid)
-        return web.json_response({"status": "ok"})
+        # Stop worker task if running
+        for w_key in list(bot_state.account_workers.keys()):
+            if w_key == uid or (len(w_key) >= 10 and uid.startswith(w_key)):
+                bot_state.account_workers[w_key].cancel()
+                del bot_state.account_workers[w_key]
+
+        bot_state.log(f"Account {uid} permanently removed", "warning", uid)
+        return web.json_response({"status": "ok", "deleted_uid": uid})
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)})
+
+
+async def handle_delete_error_accounts(request: web.Request) -> web.Response:
+    """Permanently delete all quarantined error accounts from accounts.json, runtime state, and workers."""
+    try:
+        error_uids = set(str(k).strip() for k in bot_state.error_accounts.keys())
+        if not error_uids:
+            return web.json_response({"status": "ok", "deleted_count": 0, "message": "No error accounts to delete"})
+
+        async with request.app["accounts_lock"]:
+            exists = await _run_dashboard_io(request.app, os.path.exists, ACCOUNTS_FILE)
+            if exists:
+                existing = await _run_dashboard_io(request.app, _read_accounts_file)
+                # Filter out any account whose uid or token matches any quarantined error uid
+                new_list = []
+                for acc in existing:
+                    if not isinstance(acc, dict):
+                        continue
+                    a_uid = str(acc.get("uid", "")).strip()
+                    a_tok = str(acc.get("token", "")).strip()
+                    a_tok_prefix = a_tok[:20]
+                    a_tok_short = a_tok[:10]
+                    if (a_uid and a_uid in error_uids) or (a_tok and (a_tok in error_uids or a_tok_prefix in error_uids or a_tok_short in error_uids)):
+                        continue
+                    new_list.append(acc)
+                await _run_dashboard_io(request.app, _write_accounts_file, new_list)
+
+        # Cancel all workers associated with error accounts
+        cancelled_workers = 0
+        for uid in error_uids:
+            if uid in bot_state.accounts:
+                del bot_state.accounts[uid]
+            for w_key in list(bot_state.account_workers.keys()):
+                if w_key == uid or (len(w_key) >= 10 and uid.startswith(w_key)):
+                    bot_state.account_workers[w_key].cancel()
+                    del bot_state.account_workers[w_key]
+                    cancelled_workers += 1
+
+        deleted_count = len(error_uids)
+        bot_state.error_accounts.clear()
+        bot_state.log(f"🗑️ Realtime Deletion: {deleted_count} error accounts purged from disk and memory (1000% clean)", "success")
+        return web.json_response({"status": "ok", "deleted_count": deleted_count})
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)})
+
+
+async def handle_clear_error_accounts(request: web.Request) -> web.Response:
+    """Clear error status without removing from accounts.json (retry attempt)."""
+    try:
+        count = len(bot_state.error_accounts)
+        bot_state.error_accounts.clear()
+        for acc in bot_state.accounts.values():
+            if acc.get("status") == "ERROR":
+                acc["status"] = "ONLINE"
+                acc.pop("error_reason", None)
+        return web.json_response({"status": "ok", "cleared_count": count})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
 
@@ -454,6 +552,8 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 20333):
     app.router.add_post("/api/workers/set", handle_set_workers)
     app.router.add_post("/api/account/add", handle_add_account)
     app.router.add_post("/api/account/delete", handle_delete_account)
+    app.router.add_post("/api/account/delete_errors", handle_delete_error_accounts)
+    app.router.add_post("/api/account/clear_errors", handle_clear_error_accounts)
     app.router.add_post("/api/account/refresh", handle_refresh_account)
     app.router.add_post("/api/account/pause", handle_pause_account)
     app.router.add_post("/api/account/pause_all", handle_pause_all)

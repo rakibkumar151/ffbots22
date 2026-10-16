@@ -2386,50 +2386,75 @@ async def run_account_worker(account_data: Dict, label: str):
 
 
 async def account_loop_guest(uid: str, password: str):
+    uid_str = str(uid).strip()
     while True:
         try:
-            log_login(f"Starting login for Guest UID: {uid}")
+            log_login(f"Starting login for Guest UID: {uid_str}")
             try:
-                bot_state.update_status(str(uid), "CONNECTING")
+                bot_state.update_status(uid_str, "CONNECTING")
             except Exception:
                 pass
-            account_data = await process_account_uid_pass(uid, password)
+            account_data = await process_account_uid_pass(uid_str, password)
             if not account_data:
-                log_err(f"Login failed for UID: {uid}. Retry in 15s...")
+                err_msg = f"Login/Auth rejected for UID: {uid_str}"
+                log_err(f"{err_msg}. Retry in 15s...")
                 try:
-                    bot_state.update_status(str(uid), "ERROR")
+                    bot_state.register_error_account(uid_str, "Login rejected (Invalid credentials or blocked)", auth_type="guest")
                 except Exception:
                     pass
                 await asyncio.sleep(15)
                 continue
 
-            await run_account_worker(account_data, uid)
-            log_warn(f"Session finished for {uid}. Reconnect in 3s...")
+            # On successful login, clear from error quarantine if previously flagged
+            try:
+                bot_state.clear_error_account(uid_str)
+            except Exception:
+                pass
+
+            await run_account_worker(account_data, uid_str)
+            log_warn(f"Session finished for {uid_str}. Reconnect in 3s...")
             await asyncio.sleep(3)
         except asyncio.CancelledError:
-            log_warn(f"Worker for {uid} stopped.")
+            log_warn(f"Worker for {uid_str} stopped.")
             try:
-                bot_state.update_status(str(uid), "OFFLINE")
+                bot_state.update_status(uid_str, "OFFLINE")
             except Exception:
                 pass
             break
         except Exception as e:
-            log_err(f"Error for UID {uid}: {e}. Retry in 10s...")
+            err_msg = f"Runtime error: {e}"
+            log_err(f"Error for UID {uid_str}: {e}. Retry in 10s...")
+            try:
+                bot_state.register_error_account(uid_str, str(e), auth_type="guest")
+            except Exception:
+                pass
             await asyncio.sleep(10)
 
 
 async def account_loop_token(token: str):
-    token_label = token[:10]
+    token_str = str(token).strip()
+    token_label = token_str[:10]
     while True:
         try:
             log_login("Starting login with Access Token...")
-            account_data = await process_account_token(token)
+            account_data = await process_account_token(token_str)
             if not account_data:
-                log_err("Login failed for Token. Retry in 15s...")
+                err_msg = f"Token authentication failed for {token_label}"
+                log_err(f"{err_msg}. Retry in 15s...")
+                try:
+                    bot_state.register_error_account(token_label, "Token expired or invalid", auth_type="token")
+                except Exception:
+                    pass
                 await asyncio.sleep(15)
                 continue
 
             acc_id = str(account_data['account_id'])
+            try:
+                bot_state.clear_error_account(token_label)
+                bot_state.clear_error_account(acc_id)
+            except Exception:
+                pass
+
             await run_account_worker(account_data, acc_id)
             log_warn("Token session finished. Reconnect in 3s...")
             await asyncio.sleep(3)
@@ -2437,7 +2462,12 @@ async def account_loop_token(token: str):
             log_warn(f"Worker for token {token_label} stopped.")
             break
         except Exception as e:
+            err_msg = f"Token runtime error: {e}"
             log_err(f"Token error: {e}. Retry in 10s...")
+            try:
+                bot_state.register_error_account(token_label, str(e), auth_type="token")
+            except Exception:
+                pass
             await asyncio.sleep(10)
 
 
