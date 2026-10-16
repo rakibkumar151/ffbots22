@@ -49,10 +49,10 @@ TOKEN_CACHE_TTL = 1200
 START_MATCH_INTERVAL_MIN = 4.0
 START_MATCH_INTERVAL_MAX = 8.0
 START_MATCH_INTERVAL = 10.0
-NEW_MATCH_DELAY = 6.0
+NEW_MATCH_DELAY = 4.0
 MAX_MATCH_DURATION = 800
 MATCH_IDLE_TIMEOUT = 20.0
-MAX_CONCURRENT_MATCHES = 1
+MAX_CONCURRENT_MATCHES = getattr(bot_state, "game_workers", 3)
 HUMAN_MODE = True
 
 # Force region
@@ -1553,6 +1553,11 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
             bot_state.update_status(uid_str, "IN_MATCH" if remaining > 0 else "ONLINE", remaining)
         except Exception:
             pass
+        try:
+            if hasattr(bot_state, "worker_event") and bot_state.worker_event:
+                bot_state.worker_event.set()
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -1560,7 +1565,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
 # ============================================================
 async def functional_lone_wolf(addrs, starter_packet, account_region, client_version,
                                 key, iv, account_id="", account_data=None,
-                                max_reconnects=10):
+                                max_reconnects=10, worker_id: int = 1,
+                                stop_event: Optional[asyncio.Event] = None):
     reconnects = 0
     ip, port = addrs.split(":")
     play_matches: List[asyncio.Task] = []
@@ -1582,6 +1588,15 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
     try:
         while True:
+            if stop_event and stop_event.is_set():
+                log_info(f"[{uid_str}] Worker Thread #{worker_id} stopping cleanly.")
+                break
+
+            # Check if account is paused
+            if uid_str in bot_state.accounts and bot_state.accounts[uid_str].get("is_paused"):
+                await asyncio.sleep(2)
+                continue
+
             writer = None
             try:
                 if current_account_data:
@@ -1667,6 +1682,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                     play_matches[:] = [m for m in play_matches if not m.done()]
 
                     active_count = await _get_match_count(uid_str)
+                    max_w = getattr(bot_state, "game_workers", 3)
                     try:
                         bot_state.update_status(
                             uid_str,
@@ -1681,7 +1697,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                         current_interval = random.uniform(START_MATCH_INTERVAL_MIN, START_MATCH_INTERVAL_MAX)
                     else:
                         current_interval = START_MATCH_INTERVAL
-                    if now - last_start_time >= current_interval:
+                    if active_count < max_w and (now - last_start_time >= current_interval):
                         await send_start_match()
 
                     try:
@@ -1701,12 +1717,12 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                     no_response_count = 0
 
                     if hex_data.startswith("0300") and 10 < packet_length < 30:
-                        log_info("Match starting, please wait...")
+                        log_info(f"[Worker #{worker_id}] Match starting, please wait...")
                         continue
 
                     if hex_data.startswith("0300") and packet_length >= 300:
                         log_match("=" * 50)
-                        log_match(f"MATCH FOUND! UID: {uid_str}")
+                        log_match(f"[Worker #{worker_id}] MATCH FOUND! UID: {uid_str}")
                         log_match("=" * 50)
 
                         try:
@@ -1748,7 +1764,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
                                 match_index = await _inc_match(uid_str)
                                 total = await _get_total_match_count()
-                                log_match(f"Match #{match_index} -> UDP starting -> {server_ip_port}")
+                                log_match(f"[Worker #{worker_id}] Match #{match_index} -> UDP starting -> {server_ip_port} (Active: {total} games)")
 
                                 new_match = asyncio.create_task(
                                     play_game(
@@ -1775,8 +1791,10 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                 except Exception:
                                     pass
 
-                                log_info(f"Offline {NEW_MATCH_DELAY}s -> reload token -> new StartMatch")
-                                await asyncio.sleep(NEW_MATCH_DELAY)
+                                # Worker runs this match until finish, then immediately starts next match
+                                await new_match
+                                log_info(f"[Worker #{worker_id}] Match #{match_index} ended -> reconnecting for next match")
+                                await asyncio.sleep(random.uniform(1.5, 3.0))
                                 reconnects = 0
                                 break
 
@@ -2287,26 +2305,75 @@ async def run_account_worker(account_data: Dict, label: str):
 
         exp_task = asyncio.create_task(exp_refresher())
 
-        functional_task = asyncio.create_task(
-            functional_lone_wolf(
-                account_data['functional_addrs'],
-                tcp_packet_online,
-                reg,
-                account_data['client_version'],
-                account_data['aes_ak'],
-                account_data['iv_i'],
-                account_id=acc_id,
-                account_data=account_data
-            )
-        )
+        worker_tasks: Dict[int, asyncio.Task] = {}
+        worker_stop_events: Dict[int, asyncio.Event] = {}
 
-        await functional_task
+        async def worker_supervisor():
+            while True:
+                desired = getattr(bot_state, "game_workers", 3)
+
+                # Pause check
+                is_p = acc_id in bot_state.accounts and bot_state.accounts[acc_id].get("is_paused")
+                if is_p:
+                    for s in list(worker_stop_events.values()):
+                        s.set()
+                    await asyncio.sleep(2)
+                    continue
+
+                # Remove finished tasks
+                dead = [wid for wid, t in worker_tasks.items() if t.done()]
+                for wid in dead:
+                    del worker_tasks[wid]
+                    if wid in worker_stop_events:
+                        del worker_stop_events[wid]
+
+                # Spawn workers up to desired count
+                for wid in range(1, desired + 1):
+                    if wid not in worker_tasks or worker_tasks[wid].done():
+                        stop_ev = asyncio.Event()
+                        worker_stop_events[wid] = stop_ev
+                        t = asyncio.create_task(
+                            functional_lone_wolf(
+                                account_data['functional_addrs'],
+                                tcp_packet_online,
+                                reg,
+                                account_data['client_version'],
+                                account_data['aes_ak'],
+                                account_data['iv_i'],
+                                account_id=acc_id,
+                                account_data=account_data,
+                                worker_id=wid,
+                                stop_event=stop_ev
+                            )
+                        )
+                        worker_tasks[wid] = t
+                        log_ok(f"[{acc_id}] Worker Thread #{wid} launched -> starting match search")
+                        if wid < desired:
+                            await asyncio.sleep(1.5)
+
+                # Stop workers above desired limit
+                excess = [wid for wid in list(worker_tasks.keys()) if wid > desired]
+                for wid in excess:
+                    if wid in worker_stop_events:
+                        worker_stop_events[wid].set()
+
+                try:
+                    await asyncio.wait_for(bot_state.worker_event.wait(), timeout=3.0)
+                    bot_state.worker_event.clear()
+                except asyncio.TimeoutError:
+                    pass
+
+        supervisor_task = asyncio.create_task(worker_supervisor())
+        await supervisor_task
 
     except asyncio.CancelledError:
         raise
     except Exception as e:
         log_err(f"run_account_worker [{label}]: {e}")
     finally:
+        for t in list(worker_tasks.values()):
+            if not t.done():
+                t.cancel()
         for t in (informational_task, exp_task):
             if t and not t.done():
                 t.cancel()
@@ -2401,7 +2468,7 @@ async def main():
     log_info(f"Offline Wait         : {NEW_MATCH_DELAY}s")
     log_info(f"Non-match Reconnect  : {NON_MATCH_RECONNECT_DELAY}s")
     log_info(f"Cache Invalidation   : {int(MAX_CONSECUTIVE_PARSE_FAILURES)}x failures")
-    log_info(f"Parallel Matches     : UNLIMITED (background)")
+    log_info(f"Worker Threads       : {getattr(bot_state, 'game_workers', 3)} (Realtime Scalable)")
     log_info(f"Cache TTL            : {TOKEN_CACHE_TTL}s ({TOKEN_CACHE_TTL//60} min)")
     log_info(f"HUMAN MODE           : {'ON' if HUMAN_MODE else 'OFF'}")
     log_info(f"FORCED REGION        : {FORCE_REGION}")

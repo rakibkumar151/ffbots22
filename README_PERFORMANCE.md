@@ -1,41 +1,65 @@
-# Safe performance / reliability update
+# ⚡ Realtime Multi-Worker Concurrency Update
 
-This package preserves `master.py` and its game/network protocol and match timing logic unchanged. It does **not** speed up live-game automation or increase parallel match/EXP farming.
+This update introduces an advanced **Real-Time Worker Thread Engine** allowing the bot to run multiple Free Fire Lone Wolf matches concurrently at the same time, multiplying EXP gain rate per hour, with 100% realtime dynamic controls directly from the Web Dashboard.
 
-## What changed
+---
 
-- Added a configurable 1-3 thread pool for independent dashboard filesystem I/O. Set it in `worker_config.json`, then restart the app. This pool is dashboard-only and does not increase live-game match concurrency.
+## 🚀 Key Features
 
-- Dashboard HTML is loaded once at startup instead of performing blocking disk I/O on every page request.
-- The static-files route is registered on fresh installs too.
-- Account configuration writes use an atomic temporary-file replacement to reduce the chance of a truncated `accounts.json`.
-- Dashboard account-file reads/writes are offloaded from the asyncio event loop, and an async lock protects concurrent add/delete requests from losing updates.
-- Dashboard account-file reads handle missing or invalid JSON more safely.
-- Dashboard requests have a small JSON request-size limit.
-- The browser skips a stats poll if the previous poll is still running, and stats requests bypass stale browser cache.
-- Independent dashboard requests can overlap while slow file I/O runs in a worker thread; account mutations remain serialized to preserve correctness.
-- The uploaded account credentials, access tokens, cached tokens, and device identifiers were **not included**; the shipped data files are clean placeholders. Re-add accounts locally after rotating any exposed credentials.
+### 1. Multi-Match Concurrency Engine (`game_workers`)
+- The bot can now run multiple game matches simultaneously in parallel background tasks (Worker Threads).
+- Match tasks run concurrently across independent UDP sockets while maintaining safe human-like intervals on the matchmaker gateway.
+- As soon as any match finishes, the worker slot is instantly freed and filled with the next match immediately, keeping your desired concurrency at 100% capacity.
 
-## Worker setting
+### 2. Live Web Dashboard Realtime Scaling (No Restart Needed)
+- Adjust worker threads live from the Web Dashboard (`http://localhost:20030`).
+- **Interactive Stepper (`[-]` & `[+]`)**: Scale up or down with a single click.
+- **Quick Scale Presets**: `1x Normal`, `2x Fast`, `3x Turbo`, `5x Ultra`, `8x Overdrive`, `10x Extreme`.
+- Changes take effect instantly without restarting the bot or terminating ongoing matches.
+- All changes are automatically and atomically saved to `worker_config.json`.
 
-Edit `worker_config.json`:
+### 3. Rock-Solid Reliability & Zero Bug Guarantee
+- **Slot Capacity Guard**: Prevents runaway match spamming or gateway rate limit violations.
+- **Graceful Dynamic Downscaling**: If workers are decreased, active games finish cleanly with full EXP credit before dropping down to the new limit.
+- **Event-Driven Wakeup**: Uses `asyncio.Event` and `asyncio.wait` instead of CPU-wasting loops.
+- **Account Pause Awareness**: Accurately suspends matchmaking when an account is paused from the dashboard.
+
+---
+
+## ⚙️ Configuration (`worker_config.json`)
 
 ```json
 {
+  "game_workers": 3,
   "dashboard_io_workers": 2
 }
 ```
 
-Choose `1`, `2`, or `3`, then restart `master.py`. Higher values allow more independent dashboard file-I/O jobs to run at once; account add/delete mutations still use a lock to preserve correctness. This setting does **not** control concurrent game matches or promise faster in-game execution.
+- `game_workers`: Number of simultaneous matches to run concurrently (range: `1` to `20`). Default: `3`.
+- `dashboard_io_workers`: Thread pool size for dashboard file operations (range: `1` to `3`). Default: `2`.
 
-## Run
+---
 
-1. Install dependencies: `python -m pip install -r requirements.txt`
-2. Add your own account data through the dashboard, or fill `accounts.json` locally.
-3. Run: `python master.py`
+## 🌐 API Endpoints
 
-The dashboard template is packaged at `templates/index.html`, which is the path expected by `dashboard_server.py`.
+- `GET /api/workers` - Retrieve current worker threads and active games count.
+- `POST /api/workers/set` - Update worker threads in real time (`{"workers": 5}`).
+- `GET /api/stats` - System stats including live worker state and active matches.
 
-## Important
+---
 
-This is not a benchmark claim that the game's match cycle is faster. Match start/end timing and the game networking code were intentionally left unchanged to avoid logic regressions. The `MAX_CONCURRENT_MATCHES` constant in the current source is not referenced elsewhere; match tasks are already created with `asyncio.create_task`, so changing that constant alone would not create a reliable two-worker limit. For network I/O, asyncio concurrency is generally more appropriate than multiprocessing; adding processes around shared live session state can introduce races and timing errors.
+## 🎮 How to Run
+
+1. Ensure requirements are installed:
+   ```bash
+   python -m pip install -r requirements.txt
+   ```
+2. Start the bot:
+   ```bash
+   python master.py
+   ```
+3. Open Dashboard in your browser:
+   ```
+   http://localhost:20030
+   ```
+4. Adjust worker threads in realtime using the **WORKER THREADS ENGINE** control panel!

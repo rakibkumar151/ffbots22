@@ -14,6 +14,28 @@ from functools import partial
 from typing import Dict, List, Any, Optional
 from aiohttp import web
 
+# ==================== PATHS ====================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
+STATIC_DIR = os.path.join(TEMPLATES_DIR, "static")
+TEMPLATE_PATH = os.path.join(TEMPLATES_DIR, "index.html")
+ACCOUNTS_FILE = "accounts.json"
+WORKER_CONFIG_FILE = os.path.join(BASE_DIR, "worker_config.json")
+
+
+def _load_game_worker_count() -> int:
+    default_workers = 3
+    try:
+        if os.path.exists(WORKER_CONFIG_FILE):
+            with open(WORKER_CONFIG_FILE, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            value = int(config.get("game_workers", default_workers))
+            return max(1, min(20, value))
+    except Exception:
+        pass
+    return default_workers
+
+
 # ==================== GLOBAL STATE ====================
 class BotState:
     def __init__(self):
@@ -26,6 +48,29 @@ class BotState:
         self.account_workers: Dict[str, asyncio.Task] = {}
         self.refresh_callbacks: Dict[str, Any] = {}
         self.account_credentials: Dict[str, Dict[str, Any]] = {}
+        self.game_workers: int = _load_game_worker_count()
+        self.worker_event: asyncio.Event = asyncio.Event()
+
+    def set_game_workers(self, count: int) -> int:
+        self.game_workers = max(1, min(20, int(count)))
+        try:
+            self.worker_event.set()
+        except Exception:
+            pass
+        try:
+            cfg = {}
+            if os.path.exists(WORKER_CONFIG_FILE):
+                with open(WORKER_CONFIG_FILE, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            cfg["game_workers"] = self.game_workers
+            tmp = WORKER_CONFIG_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+            os.replace(tmp, WORKER_CONFIG_FILE)
+        except Exception as e:
+            self.log(f"Worker config save error: {e}", "warning")
+        self.log(f"⚡ Worker threads updated to {self.game_workers} (Realtime)", "success")
+        return self.game_workers
 
     def log(self, message: str, level: str = "info", uid: Optional[str] = None):
         entry = {
@@ -130,13 +175,7 @@ class BotState:
 bot_state = BotState()
 
 
-# ==================== PATHS ====================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
-STATIC_DIR = os.path.join(TEMPLATES_DIR, "static")
-TEMPLATE_PATH = os.path.join(TEMPLATES_DIR, "index.html")
-ACCOUNTS_FILE = "accounts.json"
-WORKER_CONFIG_FILE = os.path.join(BASE_DIR, "worker_config.json")
+
 
 
 def _load_dashboard_io_worker_count() -> int:
@@ -215,16 +254,12 @@ def _write_accounts_file(accounts: List[Dict[str, Any]]) -> None:
 
 
 async def handle_index(request: web.Request) -> web.Response:
-    # Template is cached at startup; keep a fallback for tests/custom app setup.
-    content = request.app.get("index_html")
-    if content is None:
-        content = _load_index_content()
-        request.app["index_html"] = content
+    content = _load_index_content()
     return web.Response(
         text=content,
         content_type="text/html",
         charset="utf-8",
-        headers={"Cache-Control": "no-cache"},
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
     )
 
 
@@ -237,11 +272,36 @@ async def handle_get_stats(request: web.Request) -> web.Response:
         "total_matches_started": bot_state.total_matches,
         "total_gained_exp": bot_state.total_gained_exp,
         "total_active_matches": bot_state.get_total_active_matches(),
+        "game_workers": getattr(bot_state, "game_workers", 3),
         "exp_per_hour": bot_state.get_exp_per_hour(),
         "accounts": accounts_data,
         "logs": bot_state.logs[-60:],
         "uptime": int(time.time() - bot_state.start_time)
     })
+
+
+async def handle_get_workers(request: web.Request) -> web.Response:
+    return web.json_response({
+        "status": "ok",
+        "game_workers": getattr(bot_state, "game_workers", 3),
+        "total_active_matches": bot_state.get_total_active_matches()
+    })
+
+
+async def handle_set_workers(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        val = data.get("workers")
+        if val is None:
+            return web.json_response({"status": "error", "error": "Missing workers field"})
+        new_count = bot_state.set_game_workers(val)
+        return web.json_response({
+            "status": "ok",
+            "game_workers": new_count,
+            "total_active_matches": bot_state.get_total_active_matches()
+        })
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)})
 
 
 async def handle_add_account(request: web.Request) -> web.Response:
@@ -390,6 +450,8 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 20333):
     app["accounts_lock"] = asyncio.Lock()
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/stats", handle_get_stats)
+    app.router.add_get("/api/workers", handle_get_workers)
+    app.router.add_post("/api/workers/set", handle_set_workers)
     app.router.add_post("/api/account/add", handle_add_account)
     app.router.add_post("/api/account/delete", handle_delete_account)
     app.router.add_post("/api/account/refresh", handle_refresh_account)
