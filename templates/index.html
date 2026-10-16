@@ -771,9 +771,12 @@ function setStatus(on){
   setText("p-status",on?"Online":"Offline");
 }
 
+let statsFetchInFlight = false;
 async function fetchStats(){
+  if(statsFetchInFlight)return;
+  statsFetchInFlight=true;
   try{
-    const r=await fetch("/api/stats");
+    const r=await fetch("/api/stats",{cache:"no-store"});
     if(!r.ok)throw new Error("HTTP "+r.status);
     const d=await r.json();
     const accs=Array.isArray(d.accounts)?d.accounts:[];
@@ -798,6 +801,7 @@ async function fetchStats(){
     renderLogs(logs);
     setStatus(true);
   }catch(e){console.warn("Sync error:",e);setStatus(false)}
+  finally{statsFetchInFlight=false}
 }
 
 function copyText(txt,label){
