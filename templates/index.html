@@ -333,6 +333,43 @@ body.nav-open .sidebar{transform:none}
 .worker-panel-foot{display:flex;align-items:center;gap:8px;margin-top:16px;padding-top:12px;border-top:1px solid rgba(56,189,248,.08);font-size:12px;color:var(--text-mute);line-height:1.5}
 .worker-panel-foot i{color:var(--cyan-400)}
 
+/* ==================== PROXY SENTINEL CONTROLLER ==================== */
+.proxy-control-panel{background:var(--surface);border:1px solid var(--line-hi);border-radius:20px;padding:20px 24px;margin-top:18px;position:relative;overflow:hidden;box-shadow:0 16px 48px rgba(0,0,0,.45);transition:all var(--dur) var(--ease)}
+.proxy-control-panel::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,#38bdf8,#818cf8,#3b82f6)}
+.proxy-control-panel.proxy-active{border-color:rgba(56,189,248,.6);box-shadow:0 16px 48px rgba(0,0,0,.5),0 0 30px rgba(56,189,248,.15)}
+.proxy-control-panel.proxy-active::before{background:linear-gradient(90deg,#10b981,#38bdf8,#0ea5e9)}
+.proxy-panel-head{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid rgba(56,189,248,.1)}
+.proxy-panel-title{display:flex;align-items:center;gap:14px}
+.proxy-panel-title .p-icon{width:46px;height:46px;border-radius:14px;background:var(--grad-blue-soft);border:1px solid var(--line-hi);display:grid;place-items:center;color:var(--cyan-300);font-size:22px;box-shadow:0 0 20px rgba(56,189,248,.3);transition:all .3s}
+.proxy-control-panel.proxy-active .p-icon{background:rgba(16,185,129,.18);border-color:rgba(16,185,129,.4);color:#34d399;box-shadow:0 0 20px rgba(16,185,129,.35)}
+.p-heading{font-family:'Cinzel',serif;font-size:16px;font-weight:900;letter-spacing:1px;color:#fff}
+.p-sub{font-size:11.5px;color:var(--text-mute);margin-top:2px}
+.proxy-badges{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.btn-proxy-switch{display:inline-flex;align-items:center;gap:8px;padding:8px 16px;border-radius:99px;border:1px solid var(--line);background:rgba(5,10,24,.8);color:var(--text-mute);font-size:12px;font-weight:800;font-family:'JetBrains Mono',monospace;cursor:pointer;transition:all var(--dur) var(--ease)}
+.btn-proxy-switch:hover{border-color:var(--cyan-400);transform:scale(1.03)}
+.btn-proxy-switch .p-switch-indicator{width:10px;height:10px;border-radius:50%;background:#ef4444;box-shadow:0 0 8px #ef4444;transition:all .3s}
+.btn-proxy-switch.is-on{background:rgba(16,185,129,.18);border-color:rgba(16,185,129,.45);color:#34d399}
+.btn-proxy-switch.is-on .p-switch-indicator{background:#10b981;box-shadow:0 0 12px #10b981}
+.proxy-panel-body{display:flex;flex-direction:column;gap:14px}
+.proxy-input-box{background:rgba(5,10,24,.6);border:1px solid var(--line);border-radius:14px;padding:14px 18px}
+.p-input-label{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-size:11.5px;font-weight:800;letter-spacing:.8px;color:var(--cyan-300)}
+.p-state-tip{font-size:10.5px;padding:2px 8px;border-radius:6px;background:rgba(56,189,248,.1);color:var(--cyan-400);border:1px solid rgba(56,189,248,.2);font-family:'JetBrains Mono',monospace}
+.p-input-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.p-input-wrap{flex:1;min-width:280px;position:relative}
+.p-input-wrap i{position:absolute;left:14px;top:50%;transform:translateY(-50%);color:var(--cyan-400);font-size:14px;pointer-events:none}
+.p-input-wrap input{width:100%;padding:12px 14px 12px 38px;border-radius:12px;background:rgba(10,20,40,.8);border:1px solid var(--line);color:#fff;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;outline:none;transition:all var(--dur) var(--ease)}
+.p-input-wrap input:focus{border-color:var(--cyan-400);box-shadow:0 0 0 3px rgba(56,189,248,.2);background:rgba(15,25,50,.95)}
+.p-btn-group{display:flex;align-items:center;gap:8px}
+.btn-apply-proxy{padding:12px 18px;border-radius:12px;font-weight:800;white-space:nowrap}
+.btn-test-proxy{padding:12px 16px;border-radius:12px;font-weight:800;white-space:nowrap;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.3);color:var(--cyan-300)}
+.btn-test-proxy:hover{background:rgba(56,189,248,.25);border-color:var(--cyan-400);color:#fff}
+.proxy-panel-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:12px;padding-top:10px;border-top:1px solid rgba(56,189,248,.08);font-size:11.5px;color:var(--text-mute);font-family:'JetBrains Mono',monospace}
+.p-foot-item{display:flex;align-items:center;gap:6px}
+.p-foot-item i{color:var(--cyan-400)}
+.p-foot-item-right{color:var(--ok);font-size:11px;font-weight:700}
+.proxy-top-pill{cursor:pointer;transition:all var(--dur) var(--ease)}
+.proxy-top-pill:hover{border-color:var(--cyan-400);transform:translateY(-1px)}
+
 /* Error Quarantine Panel */
 .error-quarantine-panel{margin-top:20px;border-radius:20px;background:linear-gradient(135deg,rgba(30,10,18,.75),rgba(15,10,25,.85));border:1px solid rgba(248,113,113,.25);backdrop-filter:blur(20px);padding:20px 24px;box-shadow:0 20px 60px rgba(0,0,0,.6),0 0 30px rgba(248,113,113,.08);position:relative;overflow:hidden;transition:all var(--dur) var(--ease)}
 .error-quarantine-panel::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;background:linear-gradient(180deg,#ef4444,#f87171,#f43f5e)}
@@ -398,6 +435,10 @@ body.nav-open .sidebar{transform:none}
     <i class="fa-solid fa-microchip" style="color:var(--cyan-400)"></i>
     <span id="top-workers-text">Workers: 3</span>
     <span id="top-workers-active" style="color:var(--ok);font-size:11px;font-weight:800">(0 Active)</span>
+  </div>
+  <div class="pill proxy-top-pill" id="proxy-top-pill" onclick="toggleProxyGuard()" title="Realtime Proxy Guard (Login Fallback Only - 0% Waste)">
+    <i class="fa-solid fa-shield-halved" id="top-proxy-icon" style="color:var(--text-mute)"></i>
+    <span id="top-proxy-text">Proxy: OFF</span>
   </div>
   <div class="clock" id="clock">--:--:--</div>
   <div class="pill" id="pill"><i class="dot"></i><span id="side-status">ONLINE</span></div>
@@ -478,6 +519,55 @@ body.nav-open .sidebar{transform:none}
       <div class="worker-panel-foot">
         <i class="fa-solid fa-circle-info"></i>
         <span>Scaling workers allows the bot to queue and play multiple Free Fire Lone Wolf matches concurrently, multiplying your EXP gain rate per hour in real time.</span>
+      </div>
+    </div>
+
+    <!-- REALTIME PROXY FALLBACK GUARD -->
+    <div class="proxy-control-panel" id="proxy-control-card">
+      <div class="proxy-panel-head">
+        <div class="proxy-panel-title">
+          <div class="p-icon" id="proxy-icon-box"><i class="fa-solid fa-shield-halved"></i></div>
+          <div>
+            <div class="p-heading">REALTIME PROXY SENTINEL (LOGIN FALLBACK ONLY)</div>
+            <div class="p-sub">Guaranteed 0% Traffic Waste · Dynamic Auto-Randomized SID Per Request</div>
+          </div>
+        </div>
+        <div class="proxy-badges">
+          <span class="tag online" id="proxy-mode-badge" style="background:rgba(56,189,248,.12);color:var(--cyan-300);border:1px solid var(--cyan-400)">
+            <i class="fa-solid fa-filter"></i> Strict Fallback Only
+          </span>
+          <span class="tag" id="proxy-sid-badge" style="background:rgba(168,85,247,.15);color:#c084fc;border:1px solid rgba(168,85,247,.4)">
+            <i class="fa-solid fa-dice"></i> Dynamic Random SID
+          </span>
+          <button class="btn-proxy-switch" id="proxy-toggle-btn" onclick="toggleProxyGuard()" title="Toggle Realtime Proxy ON/OFF">
+            <span class="p-switch-indicator" id="proxy-switch-indicator"></span>
+            <span id="proxy-toggle-text">PROXY: OFF</span>
+          </button>
+        </div>
+      </div>
+      <div class="proxy-panel-body">
+        <div class="proxy-input-box">
+          <div class="p-input-label">
+            <span><i class="fa-solid fa-network-wired"></i> PROXY GATEWAY (HOST:PORT:USER:PASS)</span>
+            <span class="p-state-tip" id="proxy-tip">DIRECT ONLY (0 PROXY USAGE)</span>
+          </div>
+          <div class="p-input-row">
+            <div class="p-input-wrap">
+              <i class="fa-solid fa-key"></i>
+              <input type="text" id="proxy-string-input" placeholder="e.g. proxy.h143.xyz:8080:user:pass" spellcheck="false" autocomplete="off" onkeydown="if(event.key==='Enter')saveProxyConfig()">
+            </div>
+            <div class="p-btn-group">
+              <button class="btn primary btn-apply-proxy" onclick="saveProxyConfig()"><i class="fa-solid fa-floppy-disk"></i> Save & Apply</button>
+              <button class="btn secondary btn-test-proxy" id="btn-test-proxy" onclick="testProxyConnection()"><i class="fa-solid fa-vial"></i> Test Ping</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="proxy-panel-foot">
+        <div class="p-foot-item"><i class="fa-solid fa-fingerprint"></i> Last Assigned IP: <b id="proxy-last-ip" style="color:var(--cyan-300)">None</b></div>
+        <div class="p-foot-item"><i class="fa-solid fa-hashtag"></i> Last Used SID: <b id="proxy-last-sid" style="color:#c084fc">None</b></div>
+        <div class="p-foot-item"><i class="fa-solid fa-shield-check"></i> Fallbacks Used: <b id="proxy-fallback-count" style="color:var(--ok)">0</b></div>
+        <div class="p-foot-item-right"><i class="fa-solid fa-lock"></i> 100% Match Traffic Bypasses Proxy (Balance 1000% Protected)</div>
       </div>
     </div>
 
@@ -1131,9 +1221,149 @@ async function fetchStats(){
     renderErrorAccounts(errs);
     renderAccounts(accs);
     renderLogs(logs);
+    if(d.proxy){
+      renderProxyUI(d.proxy);
+    }
     setStatus(true);
   }catch(e){console.warn("Sync error:",e);setStatus(false)}
   finally{statsFetchInFlight=false}
+}
+
+let currentProxyEnabled = false;
+let proxyActionInFlight = false;
+
+function renderProxyUI(p){
+  if(!p) return;
+  currentProxyEnabled = Boolean(p.enabled);
+
+  const card = document.getElementById("proxy-control-card");
+  if(card) card.classList.toggle("proxy-active", currentProxyEnabled);
+
+  const toggleBtn = document.getElementById("proxy-toggle-btn");
+  if(toggleBtn){
+    toggleBtn.classList.toggle("is-on", currentProxyEnabled);
+    const txt = document.getElementById("proxy-toggle-text");
+    if(txt) txt.textContent = currentProxyEnabled ? "PROXY: ON" : "PROXY: OFF";
+  }
+
+  const topPill = document.getElementById("proxy-top-pill");
+  const topTxt = document.getElementById("top-proxy-text");
+  const topIcon = document.getElementById("top-proxy-icon");
+  if(topPill && topTxt && topIcon){
+    topTxt.textContent = currentProxyEnabled ? "Proxy: ON" : "Proxy: OFF";
+    topIcon.style.color = currentProxyEnabled ? "var(--ok)" : "var(--text-mute)";
+    topPill.style.borderColor = currentProxyEnabled ? "rgba(16,185,129,.45)" : "var(--line)";
+  }
+
+  const tip = document.getElementById("proxy-tip");
+  if(tip){
+    tip.textContent = currentProxyEnabled ? "ACTIVE (LOGIN FALLBACK ONLY)" : "DIRECT ONLY (0 PROXY USAGE)";
+    tip.style.color = currentProxyEnabled ? "#34d399" : "var(--cyan-400)";
+    tip.style.background = currentProxyEnabled ? "rgba(16,185,129,.12)" : "rgba(56,189,248,.1)";
+    tip.style.borderColor = currentProxyEnabled ? "rgba(16,185,129,.3)" : "rgba(56,189,248,.2)";
+  }
+
+  const inp = document.getElementById("proxy-string-input");
+  if(inp && document.activeElement !== inp && p.formatted_string){
+    inp.value = p.formatted_string;
+  }
+
+  if(p.stats){
+    const lastIp = document.getElementById("proxy-last-ip");
+    if(lastIp) lastIp.textContent = p.stats.last_assigned_ip || "None";
+    const lastSid = document.getElementById("proxy-last-sid");
+    if(lastSid) lastSid.textContent = p.stats.last_used_sid ? `sid_${p.stats.last_used_sid}` : "None";
+    const countEl = document.getElementById("proxy-fallback-count");
+    if(countEl) countEl.textContent = p.stats.total_fallback_successes || 0;
+  }
+}
+
+async function toggleProxyGuard(){
+  if(proxyActionInFlight) return;
+  proxyActionInFlight = true;
+  const targetState = !currentProxyEnabled;
+  try {
+    const res = await fetch("/api/proxy/toggle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: targetState })
+    });
+    const d = await res.json();
+    if(d.status === "ok"){
+      renderProxyUI(d.proxy);
+      toast(targetState ? "🛡️ Proxy Sentinel Guard ON (Fallback Active)" : "⚡ Proxy Sentinel Guard OFF (Direct Only - 0% Waste)", targetState ? "success" : "info");
+    } else {
+      toast("Proxy toggle error: " + (d.error || "Failed"), "error");
+    }
+  } catch(e) {
+    toast("Connection error", "error");
+  } finally {
+    proxyActionInFlight = false;
+  }
+}
+
+async function saveProxyConfig(){
+  const inp = document.getElementById("proxy-string-input");
+  if(!inp) return;
+  const val = inp.value.trim();
+  if(!val){
+    toast("Please enter a proxy string (host:port:user:pass)", "error");
+    return;
+  }
+  if(proxyActionInFlight) return;
+  proxyActionInFlight = true;
+  try {
+    const res = await fetch("/api/proxy/update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ proxy_str: val, enabled: currentProxyEnabled })
+    });
+    const d = await res.json();
+    if(d.status === "ok"){
+      renderProxyUI(d.proxy);
+      toast("🛡️ Proxy Configuration Saved & Ready (Strict Fallback)", "success");
+    } else {
+      toast("Save failed: " + (d.error || "Invalid format"), "error");
+    }
+  } catch(e) {
+    toast("Connection error", "error");
+  } finally {
+    proxyActionInFlight = false;
+  }
+}
+
+async function testProxyConnection(){
+  const inp = document.getElementById("proxy-string-input");
+  const testBtn = document.getElementById("btn-test-proxy");
+  const str = inp ? inp.value.trim() : "";
+  if(testBtn){
+    testBtn.disabled = true;
+    testBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Testing...';
+  }
+  try {
+    const res = await fetch("/api/proxy/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ proxy_str: str })
+    });
+    const d = await res.json();
+    if(d.ok){
+      toast(`✅ Proxy Online! Assigned IP: ${d.ip} (${d.latency_ms}ms) [Random SID: ${d.sid}]`, "success");
+      const lastIp = document.getElementById("proxy-last-ip");
+      if(lastIp) lastIp.textContent = d.ip;
+      const lastSid = document.getElementById("proxy-last-sid");
+      if(lastSid) lastSid.textContent = `sid_${d.sid}`;
+    } else {
+      toast(`❌ Proxy Test Failed: ${d.error || "Unreachable"}`, "error");
+    }
+  } catch(e) {
+    toast("Test connection error: " + e.message, "error");
+  } finally {
+    if(testBtn){
+      testBtn.disabled = false;
+      testBtn.innerHTML = '<i class="fa-solid fa-vial"></i> Test Ping';
+    }
+  }
 }
 
 function copyText(txt,label){
