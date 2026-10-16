@@ -7,7 +7,10 @@ Full Web Dashboard with Blue Ninja Theme
 import asyncio
 import json
 import os
+import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Dict, List, Any, Optional
 from aiohttp import web
 
@@ -133,22 +136,96 @@ TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 STATIC_DIR = os.path.join(TEMPLATES_DIR, "static")
 TEMPLATE_PATH = os.path.join(TEMPLATES_DIR, "index.html")
 ACCOUNTS_FILE = "accounts.json"
+WORKER_CONFIG_FILE = os.path.join(BASE_DIR, "worker_config.json")
+
+
+def _load_dashboard_io_worker_count() -> int:
+    """Read a safe 1-3 worker setting for dashboard filesystem I/O only."""
+    default_workers = 2
+    try:
+        with open(WORKER_CONFIG_FILE, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        value = int(config.get("dashboard_io_workers", default_workers))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError, AttributeError):
+        value = default_workers
+    return max(1, min(3, value))
+
+
+DASHBOARD_IO_WORKERS = _load_dashboard_io_worker_count()
+
+
+async def _run_dashboard_io(app: web.Application, func, *args):
+    """Run independent blocking dashboard I/O off the asyncio event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        app["dashboard_io_executor"], partial(func, *args)
+    )
+
+
+async def _cleanup_dashboard_io_executor(app: web.Application) -> None:
+    executor = app.get("dashboard_io_executor")
+    if executor is not None:
+        executor.shutdown(wait=False)
 
 
 # ==================== HTTP HANDLERS ====================
 
-async def handle_index(request: web.Request) -> web.Response:
+def _load_index_content() -> str:
+    """Load the dashboard template once so requests do not repeatedly read disk."""
     if os.path.exists(TEMPLATE_PATH):
         with open(TEMPLATE_PATH, "r", encoding="utf-8") as f:
-            content = f.read()
-    else:
-        content = """
-        <html><body style="background:#050a18;color:#e8f4ff;font-family:sans-serif;padding:40px;text-align:center">
-        <h1>⚠️ templates/index.html not found!</h1>
-        <p>Please create templates/index.html</p>
-        </body></html>
-        """
-    return web.Response(text=content, content_type="text/html", charset="utf-8")
+            return f.read()
+    return """
+    <html><body style="background:#050a18;color:#e8f4ff;font-family:sans-serif;padding:40px;text-align:center">
+    <h1>⚠️ templates/index.html not found!</h1>
+    <p>Please create templates/index.html</p>
+    </body></html>
+    """
+
+
+def _read_accounts_file() -> List[Dict[str, Any]]:
+    """Read account configuration defensively; malformed files fail closed."""
+    if not os.path.exists(ACCOUNTS_FILE):
+        return []
+    try:
+        with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _write_accounts_file(accounts: List[Dict[str, Any]]) -> None:
+    """Atomically replace accounts.json to avoid a partial file on interruption."""
+    target = os.path.abspath(ACCOUNTS_FILE)
+    directory = os.path.dirname(target) or os.curdir
+    fd, temp_path = tempfile.mkstemp(prefix=".accounts-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(accounts, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, target)
+    finally:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+
+
+async def handle_index(request: web.Request) -> web.Response:
+    # Template is cached at startup; keep a fallback for tests/custom app setup.
+    content = request.app.get("index_html")
+    if content is None:
+        content = _load_index_content()
+        request.app["index_html"] = content
+    return web.Response(
+        text=content,
+        content_type="text/html",
+        charset="utf-8",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 async def handle_get_stats(request: web.Request) -> web.Response:
@@ -170,32 +247,30 @@ async def handle_get_stats(request: web.Request) -> web.Response:
 async def handle_add_account(request: web.Request) -> web.Response:
     try:
         data = await request.json()
-        existing = []
-        if os.path.exists(ACCOUNTS_FILE):
-            try:
-                with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-                    existing = json.load(f)
-            except Exception:
-                existing = []
 
-        if "uid" in data and "password" in data:
-            uid = str(data["uid"]).strip()
-            pwd = str(data["password"]).strip()
-            if not uid or not pwd:
-                return web.json_response({"status": "error", "error": "UID and Password required"})
-            existing = [acc for acc in existing if str(acc.get("uid")) != uid]
-            existing.append({"uid": uid, "password": pwd})
-        elif "token" in data:
-            token = str(data["token"]).strip()
-            if not token:
-                return web.json_response({"status": "error", "error": "Token required"})
-            existing = [acc for acc in existing if acc.get("token") != token]
-            existing.append({"token": token})
-        else:
-            return web.json_response({"status": "error", "error": "Invalid payload"})
+        # Keep read-modify-write atomic across overlapping HTTP requests, while
+        # sending the blocking filesystem work to a worker thread so it does
+        # not stall unrelated asyncio tasks.
+        async with request.app["accounts_lock"]:
+            existing = await _run_dashboard_io(request.app, _read_accounts_file)
 
-        with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(existing, f, indent=2)
+            if "uid" in data and "password" in data:
+                uid = str(data["uid"]).strip()
+                pwd = str(data["password"]).strip()
+                if not uid or not pwd:
+                    return web.json_response({"status": "error", "error": "UID and Password required"})
+                existing = [acc for acc in existing if not isinstance(acc, dict) or str(acc.get("uid")) != uid]
+                existing.append({"uid": uid, "password": pwd})
+            elif "token" in data:
+                token = str(data["token"]).strip()
+                if not token:
+                    return web.json_response({"status": "error", "error": "Token required"})
+                existing = [acc for acc in existing if not isinstance(acc, dict) or acc.get("token") != token]
+                existing.append({"token": token})
+            else:
+                return web.json_response({"status": "error", "error": "Invalid payload"})
+
+            await _run_dashboard_io(request.app, _write_accounts_file, existing)
 
         bot_state.log(f"New account added: {data.get('uid') or 'Token'}", "success")
 
@@ -211,12 +286,19 @@ async def handle_delete_account(request: web.Request) -> web.Response:
     try:
         data = await request.json()
         uid = str(data.get("uid")).strip()
-        if os.path.exists(ACCOUNTS_FILE):
-            with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-            existing = [acc for acc in existing if str(acc.get("uid")) != uid and str(acc.get("token", ""))[:20] != uid]
-            with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
-                json.dump(existing, f, indent=2)
+
+        # Serialize file mutations to prevent concurrent add/delete requests
+        # from overwriting each other's changes. Disk I/O itself is off-loop.
+        async with request.app["accounts_lock"]:
+            exists = await _run_dashboard_io(request.app, os.path.exists, ACCOUNTS_FILE)
+            if exists:
+                existing = await _run_dashboard_io(request.app, _read_accounts_file)
+                existing = [
+                    acc for acc in existing
+                    if not isinstance(acc, dict)
+                    or (str(acc.get("uid")) != uid and str(acc.get("token", ""))[:20] != uid)
+                ]
+                await _run_dashboard_io(request.app, _write_accounts_file, existing)
 
         if uid in bot_state.accounts:
             del bot_state.accounts[uid]
@@ -293,7 +375,19 @@ async def handle_clear_logs(request: web.Request) -> web.Response:
 # ==================== SERVER START ====================
 
 async def start_web_dashboard(host: str = "0.0.0.0", port: int = 20333):
-    app = web.Application()
+    app = web.Application(client_max_size=64 * 1024)
+    # A small, configurable thread pool for independent dashboard file I/O.
+    # This pool does not control or increase live-game match concurrency.
+    app["dashboard_io_executor"] = ThreadPoolExecutor(
+        max_workers=DASHBOARD_IO_WORKERS,
+        thread_name_prefix="dashboard-io",
+    )
+    app.on_cleanup.append(_cleanup_dashboard_io_executor)
+    print(f"[+] Dashboard I/O workers: {DASHBOARD_IO_WORKERS} (range 1-3)")
+    # Preload the HTML once rather than doing blocking disk I/O per page request.
+    app["index_html"] = _load_index_content()
+    # Per-app lock prevents overlapping account file updates from losing data.
+    app["accounts_lock"] = asyncio.Lock()
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/stats", handle_get_stats)
     app.router.add_post("/api/account/add", handle_add_account)
@@ -304,13 +398,12 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 20333):
     app.router.add_post("/api/account/restart", handle_restart_account)
     app.router.add_post("/api/logs/clear", handle_clear_logs)
 
-    # Static files (logo, images)
-    if os.path.exists(STATIC_DIR):
-        app.router.add_static("/static", STATIC_DIR)
-        print(f"\033[92m[+] Static folder: {STATIC_DIR}\033[0m")
-    else:
-        os.makedirs(STATIC_DIR, exist_ok=True)
-        print(f"\033[93m[!] Created static folder: {STATIC_DIR}\033[0m")
+    # Ensure the folder exists before registering the static route, including
+    # on a fresh install where templates/static/ did not exist yet.
+    os.makedirs(STATIC_DIR, exist_ok=True)
+    app.router.add_static("/static", STATIC_DIR)
+    print(f"\033[92m[+] Static folder: {STATIC_DIR}\033[0m")
+    if not os.path.exists(os.path.join(STATIC_DIR, "logo.png")):
         print(f"\033[93m[!] Put your logo.png inside templates/static/\033[0m")
 
     runner = web.AppRunner(app)
