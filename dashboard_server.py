@@ -30,7 +30,7 @@ def _load_game_worker_count() -> int:
             with open(WORKER_CONFIG_FILE, "r", encoding="utf-8") as f:
                 config = json.load(f)
             value = int(config.get("game_workers", default_workers))
-            return max(1, min(20, value))
+            return max(1, value)
     except Exception:
         pass
     return default_workers
@@ -211,7 +211,7 @@ class BotState:
             self.accounts[uid_str].pop("error_reason", None)
 
     def set_game_workers(self, count: int) -> int:
-        self.game_workers = max(1, min(20, int(count)))
+        self.game_workers = max(1, int(count))
         try:
             self.worker_event.set()
         except Exception:
