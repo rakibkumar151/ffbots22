@@ -67,6 +67,12 @@ class BotState:
                 merged.update(self.account_id_map[i])
         for i in merged:
             self.account_id_map[i] = merged
+        # Propagate auth_uid to registered account objects
+        for acc_id, acc in self.accounts.items():
+            if acc_id in merged:
+                for candidate in merged:
+                    if candidate != acc_id and candidate.isdigit() and len(candidate) <= 12:
+                        acc["auth_uid"] = candidate
 
     def get_all_linked_ids(self, uid: str) -> Set[str]:
         uid_str = str(uid).strip()
@@ -74,6 +80,7 @@ class BotState:
             return set()
         group = set(self.account_id_map.get(uid_str, {uid_str}))
         group.add(uid_str)
+
         # Search registered accounts
         for acc_id, acc in list(self.accounts.items()):
             a_uid = str(acc.get("uid", "")).strip()
@@ -81,16 +88,36 @@ class BotState:
             a_acc = str(acc.get("account_id", "")).strip()
             a_tok = str(acc.get("token", "")).strip()
             candidates = {acc_id, a_uid, a_auth, a_acc, a_tok, a_tok[:20], a_tok[:10]} - {""}
-            if uid_str in candidates:
+            if uid_str in candidates or any(c in group for c in candidates):
                 group.update(candidates)
+
         # Search credentials
         for cred_id, cred in list(self.account_credentials.items()):
             c_uid = str(cred.get("auth_uid", "")).strip()
             c_acc = str(cred.get("account_id", "")).strip()
             c_tok = str(cred.get("token", "")).strip()
             candidates = {cred_id, c_uid, c_acc, c_tok, c_tok[:20], c_tok[:10]} - {""}
-            if uid_str in candidates:
+            if uid_str in candidates or any(c in group for c in candidates):
                 group.update(candidates)
+
+        # Cross-reference token_cache.json on disk to bridge auth_uid and in-game account_id
+        try:
+            if os.path.exists("token_cache.json"):
+                with open("token_cache.json", "r", encoding="utf-8") as f:
+                    tdata = json.load(f)
+                if isinstance(tdata, dict):
+                    for k, v in tdata.items():
+                        if isinstance(v, dict):
+                            k_str = str(k).strip()
+                            v_acc = str(v.get("account_id", "")).strip()
+                            v_auth = str(v.get("auth_uid", "")).strip()
+                            v_tok = str(v.get("access_token", "")).strip()
+                            entry_ids = {k_str, v_acc, v_auth, v_tok, v_tok[:20], v_tok[:10]} - {""}
+                            if uid_str in entry_ids or any(e in group for e in entry_ids):
+                                group.update(entry_ids)
+        except Exception:
+            pass
+
         return group
 
     def is_deleted(self, uid: str) -> bool:
@@ -99,7 +126,7 @@ class BotState:
             return False
         if uid_str in self.deleted_uids:
             return True
-        for linked in self.account_id_map.get(uid_str, ()):
+        for linked in self.get_all_linked_ids(uid_str):
             if linked in self.deleted_uids:
                 return True
         return False
@@ -572,10 +599,16 @@ async def handle_add_account(request: web.Request) -> web.Response:
 async def handle_delete_account(request: web.Request) -> web.Response:
     try:
         data = await request.json()
-        uid = str(data.get("uid")).strip()
+        uid = str(data.get("uid", "")).strip()
+        auth_uid = str(data.get("auth_uid", "")).strip()
 
-        # Stop worker tasks, set stop events, close sockets, and mark as permanently dead in memory
-        all_ids = bot_state.stop_and_purge_account(uid)
+        all_ids = set()
+        if uid:
+            all_ids.update(bot_state.stop_and_purge_account(uid))
+        if auth_uid:
+            all_ids.update(bot_state.stop_and_purge_account(auth_uid))
+        if not all_ids and uid:
+            all_ids.add(uid)
 
         # Invalidate credential cache for all linked identifiers
         if "on_cache_invalidate" in bot_state.refresh_callbacks:
@@ -584,6 +617,32 @@ async def handle_delete_account(request: web.Request) -> web.Response:
                     bot_state.refresh_callbacks["on_cache_invalidate"](i)
                 except Exception:
                     pass
+
+        # Clean up disk cache (token_cache.json)
+        try:
+            if os.path.exists("token_cache.json"):
+                with open("token_cache.json", "r", encoding="utf-8") as f:
+                    tdata = json.load(f)
+                if isinstance(tdata, dict):
+                    mod = False
+                    for tk in list(tdata.keys()):
+                        entry = tdata.get(tk)
+                        match = False
+                        if tk in all_ids:
+                            match = True
+                        elif isinstance(entry, dict):
+                            e_acc = str(entry.get("account_id", "")).strip()
+                            e_auth = str(entry.get("auth_uid", "")).strip()
+                            if e_acc in all_ids or e_auth in all_ids:
+                                match = True
+                        if match:
+                            del tdata[tk]
+                            mod = True
+                    if mod:
+                        with open("token_cache.json", "w", encoding="utf-8") as f:
+                            json.dump(tdata, f, indent=2)
+        except Exception as te:
+            bot_state.log(f"Cache file purge note: {te}", "info")
 
         # Serialize removal from accounts.json across all aliases (auth_uid, acc_id, token)
         async with request.app["accounts_lock"]:
@@ -597,7 +656,8 @@ async def handle_delete_account(request: web.Request) -> web.Response:
                     a_uid = str(acc.get("uid", "")).strip()
                     a_tok = str(acc.get("token", "")).strip()
                     # Check if entry matches any linked alias or original input
-                    if (a_uid and (a_uid in all_ids or a_uid == uid)) or (a_tok and (a_tok in all_ids or a_tok[:20] in all_ids or a_tok[:10] in all_ids or a_tok == uid)):
+                    if (a_uid and (a_uid in all_ids or a_uid == uid or a_uid == auth_uid)) or \
+                       (a_tok and (a_tok in all_ids or a_tok[:20] in all_ids or a_tok[:10] in all_ids or a_tok == uid or a_tok == auth_uid)):
                         continue
                     new_list.append(acc)
                 await _run_dashboard_io(request.app, _write_accounts_file, new_list)
@@ -626,6 +686,32 @@ async def handle_delete_error_accounts(request: web.Request) -> web.Response:
                     bot_state.refresh_callbacks["on_cache_invalidate"](i)
                 except Exception:
                     pass
+
+        # Clean disk cache
+        try:
+            if os.path.exists("token_cache.json"):
+                with open("token_cache.json", "r", encoding="utf-8") as f:
+                    tdata = json.load(f)
+                if isinstance(tdata, dict):
+                    mod = False
+                    for tk in list(tdata.keys()):
+                        entry = tdata.get(tk)
+                        match = False
+                        if tk in all_purged_ids:
+                            match = True
+                        elif isinstance(entry, dict):
+                            e_acc = str(entry.get("account_id", "")).strip()
+                            e_auth = str(entry.get("auth_uid", "")).strip()
+                            if e_acc in all_purged_ids or e_auth in all_purged_ids:
+                                match = True
+                        if match:
+                            del tdata[tk]
+                            mod = True
+                    if mod:
+                        with open("token_cache.json", "w", encoding="utf-8") as f:
+                            json.dump(tdata, f, indent=2)
+        except Exception:
+            pass
 
         async with request.app["accounts_lock"]:
             exists = await _run_dashboard_io(request.app, os.path.exists, ACCOUNTS_FILE)
