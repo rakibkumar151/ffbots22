@@ -768,6 +768,8 @@ async def parse_results(parsed_results):
                 field_data["data"] = await parse_results(result.data.results)
             else:
                 field_data["data"] = result.data
+        k_str = str(result.field)
+        result_dict[k_str] = field_data
         result_dict[result.field] = field_data
     return result_dict
 
@@ -778,7 +780,8 @@ async def decode_protobuf(data):
         _MULTIPRONG_THREAD_POOL,
         lambda: Parser().parse(data)
     )
-    return await parse_results(parsed_results)
+    parsed_results_dict = await parse_results(parsed_results)
+    return json.dumps(parsed_results_dict)
 
 
 # ==================== MANUAL PROTOBUF WIRE FORMAT ====================
@@ -1611,7 +1614,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
         log_err(f"[MATCH #{match_index}] error: {e}")
         return f"match #{match_index} error"
     finally:
-        if completed_cleanly:
+        if completed_cleanly or (thunder_sent and sharma_sent):
             try:
                 bot_state.increment_match(uid_str)
             except Exception:
@@ -1794,9 +1797,8 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                         log_match("=" * 50)
 
                         try:
-                            res = await decode_protobuf(hex_data[10:])
-                            if isinstance(res, str):
-                                res = json.loads(res)
+                            res_raw = await decode_protobuf(hex_data[10:])
+                            res = json.loads(res_raw) if isinstance(res_raw, str) else res_raw
                             token = None
                             udp_key = None
                             match_code = None
@@ -1806,17 +1808,22 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
                             if '42' in res and 'data' in res['42']:
                                 match_code = res['42']['data']
-                            if '5' in res and 'data' in res['5']:
-                                res_field5 = res['5']['data']
-                                server_ip_port = res_field5.get('2', {}).get('data')
-                                udp_key = res_field5.get('3', {}).get('data')
-                                token = res_field5.get('4', {}).get('data')
-                                if '42' in res_field5:
-                                    match_code = res_field5['42']['data']
+                            elif 42 in res and 'data' in res[42]:
+                                match_code = res[42]['data']
+
+                            res_field5 = res.get('5', {}).get('data') or res.get(5, {}).get('data') or {}
+                            if isinstance(res_field5, dict):
+                                server_ip_port = res_field5.get('2', {}).get('data') or res_field5.get(2, {}).get('data')
+                                udp_key = res_field5.get('3', {}).get('data') or res_field5.get(3, {}).get('data')
+                                token = res_field5.get('4', {}).get('data') or res_field5.get(4, {}).get('data')
+                                if not match_code:
+                                    match_code = res_field5.get('42', {}).get('data') or res_field5.get(42, {}).get('data')
+                                block_val = res_field5.get('1', {}).get('data') or res_field5.get(1, {}).get('data')
+
                             if '1' in res and 'data' in res['1']:
                                 match_account_id = res['1']['data']
-                            if '5' in res and 'data' in res['5']:
-                                block_val = res['5']['data'].get('1', {}).get('data')
+                            elif 1 in res and 'data' in res[1]:
+                                match_account_id = res[1]['data']
 
                             effective_acc_id = match_account_id or account_id or "BD_BOT"
 
@@ -1834,6 +1841,10 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
                                 match_index = await _inc_match(uid_str)
                                 total = await _get_total_match_count()
+                                try:
+                                    bot_state.update_status(uid_str, "IN_MATCH", total)
+                                except Exception:
+                                    pass
                                 log_match(f"Match #{match_index} -> UDP starting -> {server_ip_port}")
 
                                 new_match = asyncio.create_task(
