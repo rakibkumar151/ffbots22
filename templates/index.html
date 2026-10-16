@@ -720,6 +720,22 @@ body.nav-open .sidebar{transform:none}
   </div>
 </div>
 
+<div class="modal" id="confirmDeleteModal">
+  <div class="modal-card" style="max-width:440px;text-align:center">
+    <div style="width:58px;height:58px;border-radius:18px;background:linear-gradient(135deg,rgba(239,68,68,.25),rgba(244,63,94,.15));border:1px solid rgba(239,68,68,.4);display:inline-grid;place-items:center;color:#f87171;font-size:24px;margin-bottom:14px;box-shadow:0 0 24px rgba(239,68,68,.3)">
+      <i class="fa-solid fa-trash-can"></i>
+    </div>
+    <h2 style="font-size:19px;margin-bottom:8px;color:#fff">Delete Node Permanently?</h2>
+    <div id="confirmDeleteMsg" style="color:var(--text-dim);font-size:13px;line-height:1.55;margin-bottom:22px;background:rgba(5,10,24,.5);border:1px solid var(--line);border-radius:12px;padding:12px 14px"></div>
+    <div class="modal-actions" style="justify-content:center;gap:12px;margin-top:0">
+      <button type="button" class="btn" onclick="closeDeleteModal()">Cancel</button>
+      <button type="button" id="confirmDeleteBtn" class="btn btn-danger-glow" onclick="confirmDeleteAction()" style="padding:10px 22px">
+        <i class="fa-solid fa-trash"></i> Permanently Delete
+      </button>
+    </div>
+  </div>
+</div>
+
 <div class="toasts" id="toastBox"></div>
 
 <script>
@@ -745,7 +761,9 @@ const scrim=document.getElementById("scrim");
 function setMenu(open){document.body.classList.toggle("nav-open",open)}
 menuBtn.addEventListener("click",e=>{e.stopPropagation();setMenu(!document.body.classList.contains("nav-open"))});
 scrim.addEventListener("click",()=>setMenu(false));
-document.addEventListener("keydown",e=>{if(e.key==="Escape"){setMenu(false);closeAddModal()}});
+document.addEventListener("keydown",e=>{if(e.key==="Escape"){setMenu(false);closeAddModal();closeDeleteModal()}});
+const delModalEl = document.getElementById("confirmDeleteModal");
+if(delModalEl) delModalEl.addEventListener("click",e=>{if(e.target.id==="confirmDeleteModal")closeDeleteModal()});
 
 function navigateTo(page){
   document.querySelectorAll(".nav-item, .bn-item").forEach(n=>{n.classList.toggle("active",n.dataset.page===page)});
@@ -796,52 +814,113 @@ async function submitAddAccount(e){
   }catch(err){toast("Backend offline","error")}
 }
 
-async function deleteAccount(uid){
-  if(!confirm(`Delete node ${uid}?`))return;
-  try{
-    const d=await post("/api/account/delete",{uid});
-    if(d.status==="ok"){
-      toast(`Node ${uid} permanently deleted`,"success");
-      const c=document.getElementById("acc-"+uid);
-      if(c)c.remove();
+let deletedNodeUids = new Set();
+let pendingDelete = null;
+let pendingPurgeAllErrors = false;
+
+function openDeleteModal(uid, nickname = '', authUid = '', isError = false){
+  pendingPurgeAllErrors = false;
+  pendingDelete = { uid: String(uid).trim(), nickname: nickname || '', authUid: authUid ? String(authUid).trim() : '', isError };
+  const nameDisplay = nickname ? `${nickname} (${uid})` : `UID: ${uid}`;
+  const msgEl = document.getElementById("confirmDeleteMsg");
+  if(msgEl){
+    msgEl.innerHTML = `Are you sure you want to permanently delete node <strong>${esc(nameDisplay)}</strong>?<br><span style="color:#f87171;font-size:11.5px;margin-top:6px;display:inline-block">⚠️ This permanently stops the worker task, closes network sockets, and wipes it from accounts.json.</span>`;
+  }
+  const modal = document.getElementById("confirmDeleteModal");
+  if(modal) modal.classList.add("active");
+}
+
+function closeDeleteModal(){
+  pendingDelete = null;
+  pendingPurgeAllErrors = false;
+  const modal = document.getElementById("confirmDeleteModal");
+  if(modal) modal.classList.remove("active");
+}
+
+async function confirmDeleteAction(){
+  if(pendingPurgeAllErrors){
+    pendingPurgeAllErrors = false;
+    closeDeleteModal();
+    toast("Purging all error nodes...", "info");
+    try {
+      const d = await post("/api/account/delete_errors");
+      if(d.status === "ok"){
+        toast(`🗑️ Purged ${d.deleted_count} error IDs permanently!`, "success");
+        cachedErrorAccounts = [];
+        renderErrorAccounts([]);
+        fetchStats();
+      } else {
+        toast(d.error || "Purge failed", "error");
+      }
+    } catch(e) {
+      toast("Backend offline", "error");
+    }
+    return;
+  }
+
+  if(!pendingDelete) return;
+  const target = pendingDelete;
+  closeDeleteModal();
+  await executeDeleteAccount(target.uid, target.authUid);
+}
+
+async function executeDeleteAccount(uid, authUid = ''){
+  const targetUid = String(uid).trim();
+  const targetAuth = authUid ? String(authUid).trim() : '';
+
+  // Immediately blacklist so periodic fetchStats() never resurrects the card
+  deletedNodeUids.add(targetUid);
+  if(targetAuth) deletedNodeUids.add(targetAuth);
+
+  // Immediately remove from DOM with smooth fade animation
+  const card = document.getElementById("acc-" + targetUid);
+  if(card){
+    card.style.transition = "all 0.25s ease";
+    card.style.opacity = "0";
+    card.style.transform = "scale(0.92)";
+    setTimeout(() => { if(card && card.parentNode) card.remove(); }, 260);
+  }
+  const errRow = document.getElementById("err-row-" + targetUid);
+  if(errRow) errRow.remove();
+
+  toast(`Purging node ${targetUid}...`, "info");
+
+  try {
+    const payload = { uid: targetUid, auth_uid: targetAuth };
+    const d = await post("/api/account/delete", payload);
+    if(d.status === "ok"){
+      toast(`✅ Node ${targetUid} permanently deleted`, "success");
       fetchStats();
     } else {
-      toast(d.error||"Delete failed","error");
+      toast(d.error || "Delete failed", "error");
     }
-  }catch(e){toast("Backend offline","error")}
+  } catch(e) {
+    toast("Backend offline", "error");
+  }
+}
+
+async function deleteAccount(uid, authUid = ''){
+  openDeleteModal(uid, '', authUid, false);
 }
 
 async function deleteErrorAccount(uid){
-  if(!confirm(`⚠️ 1000% Permanently delete Error ID ${uid}? This will remove it from accounts.json immediately.`))return;
-  try{
-    const d=await post("/api/account/delete",{uid});
-    if(d.status==="ok"){
-      toast(`🗑️ Error ID ${uid} permanently deleted`,"success");
-      fetchStats();
-    } else {
-      toast(d.error||"Delete failed","error");
-    }
-  }catch(e){toast("Backend offline","error")}
+  openDeleteModal(uid, 'Quarantined Error Node', '', true);
 }
 
 async function deleteAllErrorAccounts(){
   const count = cachedErrorAccounts.length;
   if(count === 0){
-    toast("No error IDs to delete","info");
+    toast("No error IDs to delete", "info");
     return;
   }
-  if(!confirm(`⚠️ 1000% REALTIME PURGE: Delete all ${count} error IDs? They will be removed from accounts.json, tasks stopped, and never run again.`))return;
-  try{
-    const d=await post("/api/account/delete_errors");
-    if(d.status==="ok"){
-      toast(`🗑️ Purged ${d.deleted_count} error IDs permanently!`,"success");
-      cachedErrorAccounts = [];
-      renderErrorAccounts([]);
-      fetchStats();
-    } else {
-      toast(d.error||"Purge failed","error");
-    }
-  }catch(e){toast("Backend offline","error")}
+  pendingPurgeAllErrors = true;
+  pendingDelete = null;
+  const msgEl = document.getElementById("confirmDeleteMsg");
+  if(msgEl){
+    msgEl.innerHTML = `⚠️ <strong>Purge all ${count} error accounts?</strong><br><span style="color:#f87171;font-size:11.5px;margin-top:6px;display:inline-block">All ${count} error nodes will be permanently wiped from accounts.json, tasks stopped, and never run again.</span>`;
+  }
+  const modal = document.getElementById("confirmDeleteModal");
+  if(modal) modal.classList.add("active");
 }
 
 let cachedErrorAccounts = [];
@@ -1071,7 +1150,7 @@ function renderAccounts(accounts){
         <div class="acts">
           <button class="act" onclick="togglePause('${escAttr(uid)}')" title="${paused?'Resume':'Pause'}"><i class="fa-solid ${paused?'fa-play':'fa-pause'}"></i></button>
           <button class="act" onclick="refreshAcc('${escAttr(uid)}')" title="Refresh"><i class="fa-solid fa-arrows-rotate"></i></button>
-          <button class="act danger" onclick="deleteAccount('${escAttr(uid)}')" title="Delete"><i class="fa-solid fa-trash"></i></button>
+          <button class="act danger" onclick="openDeleteModal('${escAttr(uid)}','${escAttr(acc.nickname||'')}','${escAttr(acc.auth_uid||'')}')" title="Delete Node"><i class="fa-solid fa-trash"></i></button>
         </div>
       </div>`;
   });
@@ -1179,7 +1258,12 @@ async function fetchStats(){
     const r=await fetch("/api/stats",{cache:"no-store"});
     if(!r.ok)throw new Error("HTTP "+r.status);
     const d=await r.json();
-    const accs=Array.isArray(d.accounts)?d.accounts:[];
+    const rawAccs=Array.isArray(d.accounts)?d.accounts:[];
+    const accs=rawAccs.filter(a => {
+      const u1 = String(a.uid||"").trim();
+      const u2 = String(a.auth_uid||"").trim();
+      return !deletedNodeUids.has(u1) && (!u2 || !deletedNodeUids.has(u2));
+    });
     const logs=Array.isArray(d.logs)?d.logs:[];
 
     setText("stat-accounts",d.total_accounts??accs.length);
@@ -1217,7 +1301,8 @@ async function fetchStats(){
     setText("p-rate",Number(d.exp_per_hour||0).toLocaleString());
 
     cachedLogs=logs;
-    const errs = Array.isArray(d.error_accounts) ? d.error_accounts : [];
+    const rawErrs = Array.isArray(d.error_accounts) ? d.error_accounts : [];
+    const errs = rawErrs.filter(e => !deletedNodeUids.has(String(e.uid||"").trim()));
     renderErrorAccounts(errs);
     renderAccounts(accs);
     renderLogs(logs);
